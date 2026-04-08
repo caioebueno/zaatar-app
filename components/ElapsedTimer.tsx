@@ -41,9 +41,9 @@ export default function ElapsedTimer({ date, big }: Props) {
     }, [date]);
 
     if (big) return (
-        <View style={{ paddingVertical: 10, width: '100%', alignItems: 'center', justifyContent: 'center', backgroundColor: '#E6F8ED', borderColor: '#D2E9E0', borderWidth: 1, borderRadius: 12 }}>
+        <View style={{ paddingVertical: 8, width: '100%', alignItems: 'center', justifyContent: 'center', backgroundColor: '#E6F8ED', borderColor: '#D2E9E0', borderWidth: 1, borderRadius: 12 }}>
             <Text style={[styles.container, big ? {
-                borderColor: 'transparent', paddingVertical: 0, fontSize: 24,
+                borderColor: 'transparent', paddingVertical: 0, fontSize: 20,
                 paddingHorizontal: 0,
             } : {}]}>{formatTime(time)}</Text>
         </View>

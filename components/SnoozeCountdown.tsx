@@ -134,9 +134,9 @@ export default function SnoozeCountdown({
 
   return (
     <View style={{ flexDirection: "row", gap: small ? 8 : 12, alignItems: "center" }}>
-      <Feather name="clock" size={small ? 24 : 40} color="#96632C" />
+      <Feather name="clock" size={small ? 20 : 40} color="#96632C" />
       <Text
-        style={{ fontSize: small ? 24 : 36, fontWeight: "600", color: "#96632C" }}
+        style={{ fontSize: small ? 20 : 36, fontWeight: "600", color: "#96632C" }}
         {...textProps}
       >
         {formatRemaining(remaining)}

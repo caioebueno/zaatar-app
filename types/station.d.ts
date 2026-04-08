@@ -22,6 +22,7 @@ export type TPreparationStepTrack = {
   quantity: number;
   completed: boolean;
   comments?: string;
+  completedComments?: boolean;
   preparationStepModifiers?: TTPreparationStepModifierTrack[];
   preparationStepId: string;
   preparationStepCategoryId: string;
@@ -29,6 +30,7 @@ export type TPreparationStepTrack = {
 
 export type TTPreparationStepModifierTrack = {
   id: string;
+  completed?: boolean;
   modifierGroupItem: string;
   modifierGtroupItem?: TModifierGroupItem;
 };
