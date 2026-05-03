@@ -1,26 +1,22 @@
-import BackToSitemapButton from "@/components/BackToSitemapButton";
 import OrderQueueItem from "@/components/station/OrderQueueItem";
 import PreparationCategoryCard from "@/components/station/PreparationCategoryCard";
 import StationTopBar from "@/components/station/StationTopBar";
 import {
-  canViewOrder,
-  isOrderActivelySnoozed,
   isOrderCompleted,
   sortOrdersByCompletion,
   updateOrdersPreparationCategory,
 } from "@/components/station/stationUtils";
+import { API_BASE_URL } from "@/constants/api";
 import { Colors } from "@/constants/theme";
 import { TOrder } from "@/types/order";
 import type { TPreparationStepCategory, TPreparationStepTrack, TSnooze } from "@/types/station";
 import { Audio } from "expo-av";
-import { useEffect, useState } from "react";
-import { Platform, ScrollView, StyleSheet, Text, View } from "react-native";
+import { useLocalSearchParams } from "expo-router";
+import { useEffect, useMemo, useState } from "react";
+import { ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
-const STATION_ID = "2a18e3a7-2491-422a-af43-efff08031e9b";
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL ??
-  (Platform.OS === "web" ? "/api" : "http://192.168.1.151:3000/api");
+const DEFAULT_STATION_ID = "2a18e3a7-2491-422a-af43-efff08031e9b";
 
 type TPreparationCategoryApiPayload = {
   id: string;
@@ -44,6 +40,33 @@ type TPreparationCategoryApiPayload = {
     }[];
   }[];
 };
+
+type TOrderFilter = "TODO" | "COMPLETED";
+
+function getOrderProductionIndex(order: TOrder) {
+  if (typeof order.productionIndex !== "number" || !Number.isFinite(order.productionIndex)) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  return order.productionIndex;
+}
+
+function getOrdersSortedByProductionIndex(orderList: TOrder[]) {
+  return [...orderList].sort((first, second) => {
+    const firstIndex = getOrderProductionIndex(first);
+    const secondIndex = getOrderProductionIndex(second);
+
+    if (firstIndex !== secondIndex) {
+      return firstIndex - secondIndex;
+    }
+
+    return new Date(first.createdAt).getTime() - new Date(second.createdAt).getTime();
+  });
+}
+
+function getDefaultActiveOrderId(orderList: TOrder[]) {
+  return orderList[0]?.id ?? null;
+}
 
 function toPreparationCategoryApiPayload(
   category: TPreparationStepCategory,
@@ -73,24 +96,29 @@ function toPreparationCategoryApiPayload(
 }
 
 export default function Station() {
+  const { stationId: stationIdParam } = useLocalSearchParams<{ stationId?: string }>();
   const [orders, setOrders] = useState<TOrder[]>([]);
   const [activeOrderId, setActiveOrderId] = useState<string | null>(null);
+  const [orderFilter, setOrderFilter] = useState<TOrderFilter>("TODO");
+  const stationId = Array.isArray(stationIdParam)
+    ? stationIdParam[0]
+    : stationIdParam ?? DEFAULT_STATION_ID;
 
   useEffect(() => {
-    fetchOrdersByStation(STATION_ID)
+    fetchOrdersByStation(stationId)
       .then((fetchedOrders) => {
         setOrders(sortOrdersByCompletion(fetchedOrders));
-        setActiveOrderId(fetchedOrders[0]?.id);
+        setActiveOrderId(getDefaultActiveOrderId(fetchedOrders));
       })
       .catch(console.error);
-  }, []);
+  }, [stationId]);
 
   useEffect(() => {
     const watcher = watchNewOrders({
-      stationId: STATION_ID,
+      stationId,
       soundAsset: require("../assets/newOrder.mp3"),
       onNewOrders: (newOrders) => {
-        setActiveOrderId((previousId) => previousId ?? newOrders[0]?.id ?? null);
+        setActiveOrderId((previousId) => previousId ?? getDefaultActiveOrderId(newOrders));
         setOrders(sortOrdersByCompletion(newOrders));
       },
     });
@@ -98,14 +126,16 @@ export default function Station() {
     return () => {
       void watcher.stop();
     };
-  }, []);
+  }, [stationId]);
 
   const activeOrder = orders.find((order) => order.id === activeOrderId);
-  const pendingOrders = orders.filter((order) => !isOrderCompleted(order));
-  const completedOrders = orders.filter((order) => isOrderCompleted(order));
-  const canGoNext = activeOrder
-    ? isOrderCompleted(activeOrder) || isOrderActivelySnoozed(activeOrder)
-    : false;
+  const ordersByProductionIndex = useMemo(
+    () => getOrdersSortedByProductionIndex(orders),
+    [orders]
+  );
+  const pendingOrders = ordersByProductionIndex.filter((order) => !isOrderCompleted(order));
+  const completedOrders = ordersByProductionIndex.filter((order) => isOrderCompleted(order));
+  const filteredOrders = orderFilter === "TODO" ? pendingOrders : completedOrders;
 
   const handleSnooze = (preparationStepCategoryId: string, snoozes: TSnooze[]) => {
     const newOrders = updateOrdersPreparationCategory(orders, preparationStepCategoryId, {
@@ -140,129 +170,66 @@ export default function Station() {
     void markPreparationCategoryAsCompleted(payload).catch(console.error);
   };
 
-  const handleComplete = (preparationStepCategoryId: string) => {
-    const currentCategory = orders
-      .flatMap((order) => order.preparationStepCategory)
-      .find((category) => category.id === preparationStepCategoryId);
-
-    if (!currentCategory) return;
-
-    const updatedCategory: TPreparationStepCategory = {
-      ...currentCategory,
-      completed: true,
-      steps: currentCategory.steps.map((step) => ({
-        ...step,
-        completed: true,
-      })),
-    };
-
-    const newOrders = updateOrdersPreparationCategory(orders, preparationStepCategoryId, {
-      completed: updatedCategory.completed,
-      steps: updatedCategory.steps,
-    });
-    setOrders(sortOrdersByCompletion(newOrders));
-
-    const payload = toPreparationCategoryApiPayload(updatedCategory);
-    void markPreparationCategoryAsCompleted(payload).catch(console.error);
-  };
-
-  const handleNext = () => {
-    if (!activeOrder) return;
-    if (!canGoNext) return;
-
-    if (isOrderCompleted(activeOrder)) {
-      const firstPendingOrder = orders.find((order) => !isOrderCompleted(order));
-      if (firstPendingOrder) {
-        setActiveOrderId(firstPendingOrder.id);
-      }
-      return;
-    }
-
-    const findIndex = orders.findIndex((order) => order.id === activeOrderId);
-    if (findIndex === -1) return;
-
-    for (let i = findIndex + 1; i < orders.length; i++) {
-      const candidate = orders[i];
-      const isReadyNow =
-        canViewOrder(orders, candidate.id) &&
-        !isOrderCompleted(candidate) &&
-        !isOrderActivelySnoozed(candidate);
-
-      if (isReadyNow) {
-        setActiveOrderId(candidate.id);
-        return;
-      }
-    }
-  };
-
   return (
     <View style={styles.container}>
       <SafeAreaView style={styles.flexOne}>
-        <BackToSitemapButton absolute />
+
         {activeOrder ? (
           <View style={styles.flexOne}>
             <StationTopBar
-              customerName={activeOrder.customer?.name ?? undefined}
-              createdAt={activeOrder.createdAt}
-              isCompleted={isOrderCompleted(activeOrder)}
-              canGoNext={canGoNext}
-              onGoNext={handleNext}
+              orderFilter={orderFilter}
+              onChangeOrderFilter={setOrderFilter}
             />
 
             <View style={styles.contentRow}>
               <View style={styles.ordersPanel}>
-                <View style={styles.orderColumns}>
-                  <View style={styles.orderColumn}>
-                    <Text style={styles.orderColumnTitle}>Completed</Text>
-                    <ScrollView contentContainerStyle={styles.ordersListContent}>
-                      {completedOrders.length === 0 ? (
-                        <Text style={styles.emptyColumnText}>No orders</Text>
-                      ) : (
-                        completedOrders.map((order) => (
-                          <OrderQueueItem
-                            key={order.id}
-                            order={order}
-                            activeOrderId={activeOrderId}
-                            canBeViewed={canViewOrder(orders, order.id)}
-                            onPress={() => setActiveOrderId(order.id)}
-                          />
-                        ))
-                      )}
-                    </ScrollView>
-                  </View>
-
-                  <View style={styles.orderColumn}>
-                    <Text style={styles.orderColumnTitle}>To Do</Text>
-                    <ScrollView contentContainerStyle={styles.ordersListContent}>
-                      {pendingOrders.map((order) => (
-                        <OrderQueueItem
-                          key={order.id}
-                          order={order}
-                          activeOrderId={activeOrderId}
-                          canBeViewed={canViewOrder(orders, order.id)}
-                          onPress={() => setActiveOrderId(order.id)}
-                        />
-                      ))}
-                    </ScrollView>
-                  </View>
-                </View>
+                <ScrollView contentContainerStyle={styles.ordersListContent}>
+                  {filteredOrders.length === 0 ? (
+                    <Text style={styles.emptyColumnText}>Nenhum pedido</Text>
+                  ) : (
+                    filteredOrders.map((order) => (
+                      <OrderQueueItem
+                        key={order.id}
+                        order={order}
+                        activeOrderId={activeOrderId}
+                        canBeViewed
+                        onPress={() => setActiveOrderId(order.id)}
+                      />
+                    ))
+                  )}
+                </ScrollView>
               </View>
 
-              <ScrollView contentContainerStyle={styles.categoriesScrollContent} style={styles.categoriesContainer}>
-                {activeOrder.preparationStepCategory.map((item) => (
-                  <PreparationCategoryCard
-                    key={item.id}
-                    preparationCategory={item}
-                    onComplete={handleComplete}
-                    onSnooze={handleSnooze}
-                    onUpdateSteps={handleUpdateSteps}
-                  />
-                ))}
-              </ScrollView>
+              <View style={styles.categoriesPanel}>
+
+                <ScrollView contentContainerStyle={styles.categoriesScrollContent} style={styles.categoriesContainer}>
+                  <View style={styles.activeOrderSummary}>
+                    <Text style={styles.activeOrderSummaryName}>
+                      {activeOrder.customer?.name?.trim() || "Sem nome"}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.activeOrderSummaryStatus,
+                        isOrderCompleted(activeOrder) && styles.activeOrderSummaryStatusCompleted,
+                      ]}
+                    >
+                      {isOrderCompleted(activeOrder) ? "Pronto" : "Em preparo"}
+                    </Text>
+                  </View>
+                  {activeOrder.preparationStepCategory.map((item) => (
+                    <PreparationCategoryCard
+                      key={item.id}
+                      preparationCategory={item}
+                      onSnooze={handleSnooze}
+                      onUpdateSteps={handleUpdateSteps}
+                    />
+                  ))}
+                </ScrollView>
+              </View>
             </View>
           </View>
         ) : (
-          <Text>No orders</Text>
+          <Text>Nenhum pedido</Text>
         )}
       </SafeAreaView>
     </View>
@@ -312,22 +279,7 @@ const styles = StyleSheet.create({
   ordersPanel: {
     paddingVertical: 24,
     paddingLeft: 24,
-    // flex: 1
-  },
-  orderColumns: {
-    flexDirection: "row",
-    gap: 16,
-    flex: 1,
-  },
-  orderColumn: {
-    width: 180,
-  },
-  orderColumnTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: Colors.light.text,
-    paddingHorizontal: 4,
-    paddingBottom: 8,
+    width: 210,
   },
   emptyColumnText: {
     // color: Colors.light.tabIconDefault,
@@ -343,6 +295,46 @@ const styles = StyleSheet.create({
   },
   categoriesContainer: {
     flex: 1,
+  },
+  categoriesPanel: {
+    flex: 1,
+    paddingTop: 20,
+    paddingHorizontal: 16,
+  },
+  activeOrderSummary: {
+    marginHorizontal: 12,
+    marginBottom: 12,
+    width: 600,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    borderRadius: 12,
+    backgroundColor: Colors.light.foreground,
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  activeOrderSummaryName: {
+    fontSize: 22,
+    fontWeight: "700",
+    color: Colors.light.text,
+  },
+  activeOrderSummaryStatus: {
+    borderWidth: 1,
+    borderColor: "#E6DCC4",
+    backgroundColor: "#FFF7E5",
+    color: "#8F5D00",
+    fontSize: 16,
+    fontWeight: "700",
+    borderRadius: 10,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+  },
+  activeOrderSummaryStatusCompleted: {
+    borderColor: "#D2E9E0",
+    backgroundColor: "#E6F8ED",
+    color: "#107550",
   },
   categoriesScrollContent: {
     justifyContent: "center",
@@ -369,6 +361,7 @@ export function watchNewOrders({
   onError,
 }: TWatchNewOrdersOptions) {
   let previousIds = new Set<string>();
+  let previousProductionIndexById = new Map<string, number | null>();
   let isFirstFetch = true;
   let isFetching = false;
   let intervalId: ReturnType<typeof setInterval> | null = null;
@@ -397,14 +390,37 @@ export function watchNewOrders({
 
       const checkedOrders = (await fetchOrdersByStation(stationId)) as TOrder[];
       const currentIds = new Set(checkedOrders.map((order) => order.id));
+      const currentProductionIndexById = new Map<string, number | null>(
+        checkedOrders.map((order) => [
+          order.id,
+          typeof order.productionIndex === "number" && Number.isFinite(order.productionIndex)
+            ? order.productionIndex
+            : null,
+        ])
+      );
       const newOrders = checkedOrders.filter((order) => !previousIds.has(order.id));
+      const removedOrders = [...previousIds].filter((orderId) => !currentIds.has(orderId));
+      const hasProductionIndexChanges = !isFirstFetch
+        ? checkedOrders.some((order) => {
+          const previousProductionIndex = previousProductionIndexById.get(order.id) ?? null;
+          const currentProductionIndex = currentProductionIndexById.get(order.id) ?? null;
+          return previousProductionIndex !== currentProductionIndex;
+        })
+        : false;
 
       if (!isFirstFetch && newOrders.length > 0) {
         await playNotificationSound();
+      }
+
+      if (
+        !isFirstFetch &&
+        (newOrders.length > 0 || removedOrders.length > 0 || hasProductionIndexChanges)
+      ) {
         onNewOrders?.(checkedOrders);
       }
 
       previousIds = currentIds;
+      previousProductionIndexById = currentProductionIndexById;
       isFirstFetch = false;
     } catch (error) {
       onError?.(error);

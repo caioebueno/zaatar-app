@@ -1,10 +1,8 @@
-import ElapsedTimer from "@/components/ElapsedTimer";
-import SnoozeCountdown from "@/components/SnoozeCountdown";
 import { Colors } from "@/constants/theme";
 import { TOrder } from "@/types/order";
 import React from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
-import { getOrderActiveSnooze, isOrderCompleted } from "./stationUtils";
+import { isOrderCompleted } from "./stationUtils";
 
 type OrderQueueItemProps = {
   order: TOrder;
@@ -17,13 +15,41 @@ const ReadyBadgeLarge: React.FC = () => {
   return <Text style={styles.readyBadgeLarge}>Pronto</Text>;
 };
 
+function formatScheduleTime(scheduleFor: string) {
+  const scheduleDate = new Date(scheduleFor);
+  if (Number.isNaN(scheduleDate.getTime())) return null;
+
+  const hours24 = scheduleDate.getHours();
+  const minutes = scheduleDate.getMinutes();
+  const period = hours24 >= 12 ? "PM" : "AM";
+  const hours12 = hours24 % 12 || 12;
+
+  if (minutes === 0) return `${hours12}${period}`;
+
+  return `${hours12}:${String(minutes).padStart(2, "0")}${period}`;
+}
+
+const ProductionIndexBadge: React.FC<{ productionIndex?: number }> = ({ productionIndex }) => {
+  return (
+    <Text style={styles.productionIndexBadge}>
+      #{productionIndex ?? "-"}
+    </Text>
+  );
+};
+
+const ScheduleBadge: React.FC<{ scheduleFor: string }> = ({ scheduleFor }) => {
+  const scheduleLabel = formatScheduleTime(scheduleFor);
+
+  return <Text style={styles.scheduleBadge}>{scheduleLabel ?? "Agendado"}</Text>;
+};
+
 const OrderQueueItem: React.FC<OrderQueueItemProps> = ({
   order,
   activeOrderId,
   canBeViewed,
   onPress,
 }) => {
-  const hasSnooze = getOrderActiveSnooze(order);
+  const hasSchedule = typeof order.scheduleFor === "string" && order.scheduleFor.length > 0;
 
   return (
     <Pressable
@@ -40,12 +66,10 @@ const OrderQueueItem: React.FC<OrderQueueItemProps> = ({
         <View style={styles.orderReadyCard}>
           <ReadyBadgeLarge />
         </View>
-      ) : hasSnooze.hasSnooze ? (
-        <View style={styles.orderSnoozeCard}>
-          <SnoozeCountdown snooze={hasSnooze.snooze} small />
-        </View>
+      ) : hasSchedule ? (
+        <ScheduleBadge scheduleFor={order.scheduleFor as string} />
       ) : (
-        <ElapsedTimer big date={order.createdAt} />
+        <ProductionIndexBadge productionIndex={order.productionIndex} />
       )}
     </Pressable>
   );
@@ -90,15 +114,27 @@ const styles = StyleSheet.create({
     fontSize: 20,
     fontWeight: "600",
   },
-  orderSnoozeCard: {
-    backgroundColor: "#FCEFC3",
-    borderColor: "#C9A978",
+  productionIndexBadge: {
+    backgroundColor: "#EEF4FF",
+    borderColor: "#B8CBF8",
+    color: "#2C4D9A",
+    fontSize: 20,
+    fontWeight: "700",
     borderWidth: 1,
     borderRadius: 12,
-    paddingVertical: 8,
-    width: "100%",
-    alignItems: "center",
-    justifyContent: "center",
+    paddingVertical: 6,
+    paddingHorizontal: 12,
+  },
+  scheduleBadge: {
+    backgroundColor: "#F3EEFF",
+    borderColor: "#D5C4FF",
+    color: "#5E34B1",
+    fontSize: 20,
+    fontWeight: "700",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 6,
+    paddingHorizontal: 12,
   },
 });
 

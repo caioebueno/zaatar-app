@@ -48,3 +48,45 @@ Join our community of developers creating universal apps.
 
 - [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
 - [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+
+## Inventory Module
+
+Inventory screens are available at:
+
+- `/inventory/dashboard`
+- `/inventory/places`
+- `/inventory/products`
+- `/inventory/stocks`
+- `/inventory/daily-checklist`
+- `/inventory/alerts`
+
+### Environment variables
+
+- `EXPO_PUBLIC_API_BASE_URL`: Main backend base URL (the app normalizes this to include `/api`)
+- `EXPO_PUBLIC_INVENTORY_API_BASE_URL` (optional): Full inventory API base URL.  
+  Example: `https://your-domain.com/api/inventory`  
+  If omitted, app uses `${EXPO_PUBLIC_API_BASE_URL}/api/inventory`.
+
+### Inventory flow
+
+1. Dashboard summarizes active places/products, checklist progress, and open alerts.
+2. Places and Products manage inventory entities.
+3. Stocks updates current quantities per place/product.
+4. Daily Checklist opens today checklist, counts items, and submits.
+5. Alerts lists low-stock/refill alerts with ack/resolve actions.
+
+All inventory server state is managed with React Query via typed hooks in `hooks/inventory/*` and typed API client methods in `services/inventoryApi.ts`.
+
+### Daily checklist + transfer behavior
+
+- Screen route: `/inventory/daily-checklist`
+- On load, app fetches `GET /api/inventory/checklists/today` (optional `date`).
+- If no checklist exists for the selected date, user can start one with `POST /api/inventory/checklists/daily/open`.
+- Checklist rows are grouped by place and support row-level save using:
+  - `PATCH /api/inventory/checklists/:checklistId/items/:itemId`
+- Each row supports stock move through transfer modal:
+  - `POST /api/inventory/stocks/transfer`
+  - Product is fixed to row product, destination is row place, source place is selected by user.
+  - Source stock preview uses `GET /api/inventory/stocks?placeId=...`.
+- Submit uses `POST /api/inventory/checklists/:checklistId/submit` and is blocked while pending rows (without counted quantity) exist.
+- After row updates, transfers, and submit, checklist/stocks/dashboard/alerts queries are invalidated to avoid stale UI.

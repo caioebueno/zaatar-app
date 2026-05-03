@@ -1,11 +1,28 @@
 import { TOrder } from "@/types/order";
-import type { TPreparationStepCategory, TSnooze } from "@/types/station";
+import type { TPreparationStepCategory, TPreparationStepTrack, TSnooze } from "@/types/station";
+
+export function isPreparationStepTrackCompleted(track: TPreparationStepTrack): boolean {
+  const modifiers = track.preparationStepModifiers ?? [];
+  const modifiersCompleted =
+    modifiers.length > 0 ? modifiers.every((modifier) => !!modifier.completed) : true;
+  const commentsCompleted = track.comments ? !!track.completedComments : true;
+
+  return !!track.completed && modifiersCompleted && commentsCompleted;
+}
+
+export function isPreparationCategoryCompletedByTasks(
+  category: TPreparationStepCategory,
+): boolean {
+  if (category.steps.length === 0) return false;
+  return category.steps.every(isPreparationStepTrackCompleted);
+}
 
 export function isOrderCompleted(
   order: TOrder,
   _now: Date = new Date(),
 ): boolean {
-  return order.preparationStepCategory.every((category) => category.completed);
+  if (order.preparationStepCategory.length === 0) return false;
+  return order.preparationStepCategory.every(isPreparationCategoryCompletedByTasks);
 }
 
 export function getActiveSnooze(
@@ -109,7 +126,7 @@ export function canViewOrder(
   if (isOrderCompleted(orders[index])) return true;
 
   const isCategoryResolved = (category: TPreparationStepCategory) => {
-    if (category.completed) return true;
+    if (isPreparationCategoryCompletedByTasks(category)) return true;
 
     const hasSnooze = category.snoozes?.some((s) => !s.canceled);
     return !!hasSnooze;
@@ -130,16 +147,14 @@ export function canViewOrder(
 }
 
 export function sortOrdersByCompletion(orders: TOrder[]): TOrder[] {
-  const isCompleted = (order: TOrder) =>
-    order.preparationStepCategory.every((category) => category.completed);
   const getCreatedAtTime = (order: TOrder) => new Date(order.createdAt).getTime();
 
   const pendingOrders = orders
-    .filter((order) => !isCompleted(order))
+    .filter((order) => !isOrderCompleted(order))
     .sort((a, b) => getCreatedAtTime(a) - getCreatedAtTime(b));
 
   const completedOrders = orders
-    .filter((order) => isCompleted(order))
+    .filter((order) => isOrderCompleted(order))
     .sort((a, b) => getCreatedAtTime(a) - getCreatedAtTime(b));
 
   return [...pendingOrders, ...completedOrders];
