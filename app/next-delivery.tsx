@@ -754,6 +754,21 @@ export default function NextDeliveryScreen() {
                   {getPaymentMethodLabel(nextOrder.paymentMethod)}
                 </Text>
               </View>
+              <View style={styles.totalRow}>
+                <Text style={styles.totalLabel}>Status do pagamento</Text>
+                <View
+                  style={[
+                    styles.paymentStatusBadge,
+                    isNextOrderPaid
+                      ? styles.paymentStatusBadgePaid
+                      : styles.paymentStatusBadgePending,
+                  ]}
+                >
+                  <Text style={styles.paymentStatusBadgeText}>
+                    {isNextOrderPaid ? "Pago" : "Pendente"}
+                  </Text>
+                </View>
+              </View>
             </View>
 
             <View style={styles.actions}>
@@ -1049,6 +1064,25 @@ const styles = StyleSheet.create({
     fontSize: 18,
     color: "#2D2D2D",
     fontWeight: "700",
+  },
+  paymentStatusBadge: {
+    minWidth: 96,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  paymentStatusBadgePaid: {
+    backgroundColor: "#E6F8ED",
+  },
+  paymentStatusBadgePending: {
+    backgroundColor: "#FFF4DB",
+  },
+  paymentStatusBadgeText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#2D2D2D",
   },
   actions: {
     gap: 12,

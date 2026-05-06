@@ -51,10 +51,30 @@ type TModifierGroupApiShape = TModifierGroup & {
   modifier_group_items?: TModifierGroupItem[];
 };
 
+type TComboSlotOption = {
+  productId: string;
+  productName: string;
+  productTranslations?: Record<string, { title?: string; description?: string }> | null;
+  extraPrice?: number | null;
+  sortIndex?: number | null;
+};
+
+type TComboSlot = {
+  id: string;
+  name: string;
+  translations?: Record<string, { title?: string; description?: string }> | null;
+  minSelect: number;
+  maxSelect: number;
+  allowDuplicates: boolean;
+  sortIndex?: number | null;
+  options: TComboSlotOption[];
+};
+
 type TCategoryApiProduct = {
   id: string;
   name: string;
   description?: string | null;
+  itemType?: string | null;
   price: number | null;
   comparedAtPrice?: number | null;
   categoryIndex?: number | null;
@@ -63,6 +83,8 @@ type TCategoryApiProduct = {
     url: string;
   }[];
   modifierGroups?: TModifierGroup[];
+  comboSlots?: TComboSlot[];
+  comboLineItems?: TComboSlot[];
 };
 
 type TCategoryApiProductApiShape = TCategoryApiProduct & {
@@ -79,6 +101,41 @@ type TCategoryApiItem = {
 
 type TCategoryApiItemShape = TCategoryApiItem & {
   products?: TCategoryApiProductApiShape[];
+};
+
+type TPosExclusivePromotionProduct = {
+  id: string;
+  name: string;
+  itemType?: string | null;
+  visible?: boolean | null;
+  price?: number | null;
+  comparedAtPrice?: number | null;
+  translations?: Record<string, { title?: string; description?: string }> | null;
+  photos?: {
+    id: string;
+    url: string;
+  }[];
+  comboLineItems?: TComboSlot[];
+  comboSlots?: TComboSlot[];
+};
+
+type TPosExclusivePromotion = {
+  id: string;
+  name: string;
+  active: boolean;
+  expireAt?: string | null;
+  validWeekdays?: string[];
+  availableNow: boolean;
+  productIds: string[];
+  products: TPosExclusivePromotionProduct[];
+};
+
+type TPosExclusivePromotionsResponse = {
+  timezone: string;
+  at: string;
+  weekday: string;
+  onlyAvailable: boolean;
+  promotions: TPosExclusivePromotion[];
 };
 
 type TCategoryTab = {
@@ -102,7 +159,17 @@ type TCartItem = {
   product: TCategoryApiProduct;
   quantity: number;
   selectedModifiers: TCartSelectedModifier[];
+  comboSelections: TCartComboSelection[];
   comment?: string;
+};
+
+type TCartComboSelection = {
+  slotId: string;
+  slotName: string;
+  optionProductId: string;
+  optionProductName: string;
+  extraPrice: number;
+  quantity: number;
 };
 
 export type TOrderEditorInitialOrder = {
@@ -161,6 +228,14 @@ export type TOrderEditorInitialOrder = {
       id: string;
       name?: string;
       description?: string;
+    }[];
+    comboSelections?: {
+      slotId: string;
+      optionProductId: string;
+      quantity: number;
+      slotName?: string;
+      optionProductName?: string;
+      extraPrice?: number;
     }[];
     comments?: string;
     comment?: string;
@@ -282,10 +357,16 @@ type TCreateOrderRequestBody = {
         modifierId: string;
         modifierItemId: string;
       }[];
+      comboSelections?: {
+        slotId: string;
+        optionProductId: string;
+        quantity: number;
+      }[];
       description?: string;
     }[];
   };
   customerId: string;
+  source?: "POS";
   orderType: TOrderType;
   paymentMethod: TPaymentMethod;
   language?: string;
@@ -314,12 +395,22 @@ type TUpdateOrderRequestBody = {
         quantity?: number;
         comments?: string | null;
         selectedModifierGroupItemIds?: string[];
+        comboSelections?: {
+          slotId: string;
+          optionProductId: string;
+          quantity: number;
+        }[];
       }
     | {
         productId: string;
         quantity?: number;
         comments?: string | null;
         selectedModifierGroupItemIds?: string[];
+        comboSelections?: {
+          slotId: string;
+          optionProductId: string;
+          quantity: number;
+        }[];
       }
   )[];
 };
@@ -494,6 +585,17 @@ function buildModifierSignature(
   return `${product.id}__${groups.join("|")}__comment:${normalizedComment}`;
 }
 
+function buildCartItemSignature(
+  product: TCategoryApiProduct,
+  selectedByGroup: Record<string, string[]>,
+  comboSelectionsBySlot: Record<string, Record<string, number>>,
+  comment?: string,
+) {
+  const modifierSignature = buildModifierSignature(product, selectedByGroup, comment);
+  const comboSignature = getComboSelectionsSignature(comboSelectionsBySlot, product.comboSlots);
+  return `${modifierSignature}__combo:${comboSignature}`;
+}
+
 function getSelectionBounds(group: TModifierGroup) {
   const minSelection =
     typeof group.minSelection === "number" && group.minSelection >= 0
@@ -622,8 +724,12 @@ function getCartItemUnitPrice(item: TCartItem) {
     (total, modifier) => total + modifier.itemPrice,
     0,
   );
+  const comboExtras = item.comboSelections.reduce(
+    (total, selection) => total + selection.extraPrice * selection.quantity,
+    0,
+  );
 
-  return base + modifiers;
+  return base + modifiers + comboExtras;
 }
 
 function getSelectedByGroupFromCartItem(item: TCartItem) {
@@ -635,6 +741,76 @@ function getSelectedByGroupFromCartItem(item: TCartItem) {
     acc[modifier.groupId].push(modifier.itemId);
     return acc;
   }, {});
+}
+
+function getComboSlots(product: TCategoryApiProduct) {
+  return [...(product.comboSlots ?? [])].sort(
+    (first, second) => (first.sortIndex ?? 0) - (second.sortIndex ?? 0),
+  );
+}
+
+function getComboSlotTitle(slot: TComboSlot) {
+  const locale = getCurrentLanguage();
+  return slot.translations?.[locale]?.title ?? slot.translations?.en?.title ?? slot.name;
+}
+
+function getComboOptionTitle(option: TComboSlotOption) {
+  const locale = getCurrentLanguage();
+  return (
+    option.productTranslations?.[locale]?.title ??
+    option.productTranslations?.en?.title ??
+    option.productName
+  );
+}
+
+function getComboSelectionsSignature(
+  selectionsBySlot: Record<string, Record<string, number>>,
+  comboSlots: TComboSlot[] | undefined,
+) {
+  const slots = [...(comboSlots ?? [])].sort(
+    (first, second) => (first.sortIndex ?? 0) - (second.sortIndex ?? 0),
+  );
+
+  return slots
+    .map((slot) => {
+      const optionCounts = selectionsBySlot[slot.id] ?? {};
+      const serialized = Object.entries(optionCounts)
+        .filter(([, quantity]) => quantity > 0)
+        .sort(([firstId], [secondId]) => firstId.localeCompare(secondId))
+        .map(([optionId, quantity]) => `${optionId}:${quantity}`)
+        .join(",");
+
+      return `${slot.id}[${serialized}]`;
+    })
+    .join("|");
+}
+
+function getSelectedComboEntries(
+  product: TCategoryApiProduct,
+  comboSelectionsBySlot: Record<string, Record<string, number>>,
+): TCartComboSelection[] {
+  return getComboSlots(product).flatMap((slot) => {
+    const optionCounts = comboSelectionsBySlot[slot.id] ?? {};
+
+    return slot.options.flatMap((option) => {
+      const quantity = Math.max(0, Math.round(optionCounts[option.productId] ?? 0));
+      if (quantity <= 0) return [];
+
+      return [
+        {
+          slotId: slot.id,
+          slotName: getComboSlotTitle(slot),
+          optionProductId: option.productId,
+          optionProductName: getComboOptionTitle(option),
+          extraPrice:
+            typeof option.extraPrice === "number" && Number.isFinite(option.extraPrice)
+              ? option.extraPrice
+              : 0,
+          quantity,
+        } satisfies TCartComboSelection,
+      ];
+    });
+  });
 }
 
 function getSelectedByGroupForProductFromCartItem(
@@ -674,6 +850,19 @@ function getSelectedByGroupForProductFromCartItem(
   }
 
   return selectedByGroup;
+}
+
+function getComboSelectionsBySlotFromCartItem(item: TCartItem) {
+  return item.comboSelections.reduce<Record<string, Record<string, number>>>((acc, selection) => {
+    if (!acc[selection.slotId]) {
+      acc[selection.slotId] = {};
+    }
+
+    acc[selection.slotId][selection.optionProductId] =
+      (acc[selection.slotId][selection.optionProductId] ?? 0) + Math.max(1, selection.quantity);
+
+    return acc;
+  }, {});
 }
 
 function formatCustomerAddress(address: TCustomerAddress) {
@@ -817,6 +1006,47 @@ function normalizeModifierGroups(product: TCategoryApiProductApiShape): TModifie
   });
 }
 
+function normalizeComboSlots(product: TCategoryApiProductApiShape): TComboSlot[] {
+  const rawSlots = product.comboSlots ?? product.comboLineItems ?? [];
+
+  return rawSlots
+    .map((slot) => ({
+      id: slot.id,
+      name: slot.name,
+      translations: slot.translations ?? null,
+      minSelect:
+        typeof slot.minSelect === "number" && Number.isFinite(slot.minSelect)
+          ? slot.minSelect
+          : 0,
+      maxSelect:
+        typeof slot.maxSelect === "number" && Number.isFinite(slot.maxSelect)
+          ? slot.maxSelect
+          : 0,
+      allowDuplicates: !!slot.allowDuplicates,
+      sortIndex:
+        typeof slot.sortIndex === "number" && Number.isFinite(slot.sortIndex)
+          ? slot.sortIndex
+          : 0,
+      options: [...(slot.options ?? [])]
+        .map((option) => ({
+          productId: option.productId,
+          productName: option.productName,
+          productTranslations: option.productTranslations ?? null,
+          extraPrice:
+            typeof option.extraPrice === "number" && Number.isFinite(option.extraPrice)
+              ? option.extraPrice
+              : 0,
+          sortIndex:
+            typeof option.sortIndex === "number" && Number.isFinite(option.sortIndex)
+              ? option.sortIndex
+              : 0,
+        }))
+        .sort((first, second) => (first.sortIndex ?? 0) - (second.sortIndex ?? 0)),
+    }))
+    .filter((slot) => slot.options.length > 0)
+    .sort((first, second) => (first.sortIndex ?? 0) - (second.sortIndex ?? 0));
+}
+
 function getRenderableModifierGroups(product: TCategoryApiProduct | null): TModifierGroup[] {
   if (!product) return [];
 
@@ -907,8 +1137,11 @@ export default function OrderEditorModal({
   onClose,
 }: OrderEditorModalProps) {
   const [categories, setCategories] = useState<TCategoryApiItem[]>([]);
+  const [promotions, setPromotions] = useState<TPosExclusivePromotion[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [promotionsLoading, setPromotionsLoading] = useState(false);
+  const [promotionsError, setPromotionsError] = useState<string | null>(null);
   const [selectedCategoryId, setSelectedCategoryId] = useState<string>(ALL_CATEGORY_ID);
   const [cartItems, setCartItems] = useState<TCartItem[]>([]);
   const [orderType, setOrderType] = useState<TOrderType>("DELIVERY");
@@ -943,6 +1176,9 @@ export default function OrderEditorModal({
   const [selectedProductId, setSelectedProductId] = useState<string | null>(null);
   const [modifierProduct, setModifierProduct] = useState<TCategoryApiProduct | null>(null);
   const [modifierSelections, setModifierSelections] = useState<Record<string, string[]>>({});
+  const [comboSelectionsBySlot, setComboSelectionsBySlot] = useState<
+    Record<string, Record<string, number>>
+  >({});
   const [itemComment, setItemComment] = useState("");
   const [editingCartItemLineId, setEditingCartItemLineId] = useState<string | null>(null);
   const [modifierValidationError, setModifierValidationError] = useState<string | null>(null);
@@ -972,6 +1208,7 @@ export default function OrderEditorModal({
           ...category,
           products: (category.products ?? []).map((product) => {
             const normalizedGroups = normalizeModifierGroups(product);
+            const normalizedComboSlots = normalizeComboSlots(product);
             const rawGroups = Array.isArray(
               (product as Record<string, unknown>).modifierGroups,
             )
@@ -981,6 +1218,7 @@ export default function OrderEditorModal({
             return {
               ...product,
               modifierGroups: normalizedGroups.length > 0 ? normalizedGroups : rawGroups,
+              comboSlots: normalizedComboSlots,
             };
           }),
         }));
@@ -998,7 +1236,33 @@ export default function OrderEditorModal({
       }
     };
 
+    const loadPromotions = async () => {
+      try {
+        setPromotionsLoading(true);
+        setPromotionsError(null);
+
+        const response = await fetch(`${apiBaseUrl}/pos/exclusive-promotions`);
+        if (!response.ok) {
+          throw new Error("Falha ao carregar promoções");
+        }
+
+        const responseBody = (await response.json()) as TPosExclusivePromotionsResponse | null;
+        if (cancelled) return;
+        setPromotions(responseBody?.promotions ?? []);
+      } catch (loadError) {
+        if (cancelled) return;
+        const message =
+          loadError instanceof Error ? loadError.message : "Falha ao carregar promoções";
+        setPromotionsError(message);
+      } finally {
+        if (!cancelled) {
+          setPromotionsLoading(false);
+        }
+      }
+    };
+
     void loadCategories();
+    void loadPromotions();
 
     return () => {
       cancelled = true;
@@ -1038,12 +1302,14 @@ export default function OrderEditorModal({
           const mappedProduct: TCategoryApiProduct = {
             id: orderProduct.productId,
             name: resolvedName,
+            itemType: categoryProduct?.itemType ?? null,
             price: inferredUnitPrice,
             photos:
               (orderProduct.product?.photos ?? []).length > 0
                 ? orderProduct.product?.photos
                 : categoryProduct?.photos ?? [],
             modifierGroups: categoryProduct?.modifierGroups ?? [],
+            comboSlots: categoryProduct?.comboSlots ?? [],
           };
 
           const mappedModifiers: TCartSelectedModifier[] = mapImportedSelectedModifiers(
@@ -1058,6 +1324,20 @@ export default function OrderEditorModal({
             product: mappedProduct,
             quantity: fallbackQuantity,
             selectedModifiers: mappedModifiers,
+            comboSelections: (orderProduct.comboSelections ?? []).map((selection) => ({
+              slotId: selection.slotId,
+              slotName: selection.slotName ?? "Combo",
+              optionProductId: selection.optionProductId,
+              optionProductName: selection.optionProductName ?? selection.optionProductId,
+              extraPrice:
+                typeof selection.extraPrice === "number" && Number.isFinite(selection.extraPrice)
+                  ? selection.extraPrice
+                  : 0,
+              quantity:
+                typeof selection.quantity === "number" && selection.quantity > 0
+                  ? Math.round(selection.quantity)
+                  : 1,
+            })),
             comment:
               orderProduct.comments ?? orderProduct.comment ?? orderProduct.description,
           };
@@ -1160,7 +1440,7 @@ export default function OrderEditorModal({
       setCreateOrderError(null);
       setSelectedCategoryId(ALL_CATEGORY_ID);
     }
-  }, [initialOrder, mode, visible]);
+  }, [categories, initialOrder, mode, visible]);
 
   useEffect(() => {
     if (!visible || mode !== "update") return;
@@ -1212,6 +1492,10 @@ export default function OrderEditorModal({
           (item.product.modifierGroups ?? []).length > 0
             ? item.product.modifierGroups
             : categoryProduct.modifierGroups ?? [];
+        const resolvedComboSlots =
+          (item.product.comboSlots ?? []).length > 0
+            ? item.product.comboSlots
+            : categoryProduct.comboSlots ?? [];
         const remappedModifiers = remapSelectedModifiersWithGroups(
           item.selectedModifiers,
           resolvedModifierGroups,
@@ -1222,6 +1506,7 @@ export default function OrderEditorModal({
           resolvedPrice !== item.product.price ||
           resolvedPhotos !== item.product.photos ||
           resolvedModifierGroups !== item.product.modifierGroups ||
+          resolvedComboSlots !== item.product.comboSlots ||
           remappedModifiers.hasChanged;
 
         if (!hasChanged) return item;
@@ -1236,12 +1521,14 @@ export default function OrderEditorModal({
           acc[selectedModifier.groupId].push(selectedModifier.itemId);
           return acc;
         }, {});
-        const nextSignature = buildModifierSignature(
+        const nextSignature = buildCartItemSignature(
           {
             ...item.product,
             modifierGroups: resolvedModifierGroups,
+            comboSlots: resolvedComboSlots,
           },
           nextSelectedByGroup,
+          getComboSelectionsBySlotFromCartItem(item),
           normalizedComment,
         );
 
@@ -1255,6 +1542,7 @@ export default function OrderEditorModal({
             price: resolvedPrice,
             photos: resolvedPhotos,
             modifierGroups: resolvedModifierGroups,
+            comboSlots: resolvedComboSlots,
           },
         };
       }),
@@ -1585,14 +1873,62 @@ export default function OrderEditorModal({
     }
   };
 
+  const buildPromotionProduct = (promotionProduct: TPosExclusivePromotionProduct) => {
+    const categoryProduct = getCategoryProductById(categories, promotionProduct.id);
+    if (categoryProduct) {
+      return categoryProduct;
+    }
+
+    const normalizedComboSlots = normalizeComboSlots(
+      promotionProduct as TCategoryApiProductApiShape,
+    );
+
+    return {
+      id: promotionProduct.id,
+      itemType: promotionProduct.itemType ?? null,
+      name:
+        promotionProduct.translations?.[getCurrentLanguage()]?.title ??
+        promotionProduct.translations?.en?.title ??
+        promotionProduct.name ??
+        "Promoção",
+      description:
+        promotionProduct.translations?.[getCurrentLanguage()]?.description ??
+        promotionProduct.translations?.en?.description ??
+        null,
+      price:
+        typeof promotionProduct.price === "number" && Number.isFinite(promotionProduct.price)
+          ? promotionProduct.price
+          : null,
+      comparedAtPrice:
+        typeof promotionProduct.comparedAtPrice === "number" &&
+        Number.isFinite(promotionProduct.comparedAtPrice)
+          ? promotionProduct.comparedAtPrice
+          : null,
+      photos: promotionProduct.photos ?? [],
+      modifierGroups: [],
+      comboSlots: normalizedComboSlots,
+    } satisfies TCategoryApiProduct;
+  };
+
+  const handlePromotionProductPress = (promotionProduct: TPosExclusivePromotionProduct) => {
+    handleProductPress(buildPromotionProduct(promotionProduct));
+  };
+
   const addProductToCart = (
     product: TCategoryApiProduct,
     selectedByGroup: Record<string, string[]>,
+    selectedComboBySlot: Record<string, Record<string, number>>,
     comment?: string,
   ) => {
     const selectedModifiers = getSelectedModifiers(product, selectedByGroup);
+    const comboSelections = getSelectedComboEntries(product, selectedComboBySlot);
     const normalizedComment = (comment ?? "").trim();
-    const signature = buildModifierSignature(product, selectedByGroup, normalizedComment);
+    const signature = buildCartItemSignature(
+      product,
+      selectedByGroup,
+      selectedComboBySlot,
+      normalizedComment,
+    );
 
     setCartItems((previous) => {
       const found = previous.find((item) => item.signature === signature);
@@ -1613,6 +1949,7 @@ export default function OrderEditorModal({
           product,
           quantity: 1,
           selectedModifiers,
+          comboSelections,
           comment: normalizedComment || undefined,
         },
       ];
@@ -1650,9 +1987,10 @@ export default function OrderEditorModal({
 
         const normalizedComment = nextComment.trim();
         const nextSelectedByGroup = getSelectedByGroupFromCartItem(item);
-        const nextSignature = buildModifierSignature(
+        const nextSignature = buildCartItemSignature(
           item.product,
           nextSelectedByGroup,
+          getComboSelectionsBySlotFromCartItem(item),
           normalizedComment,
         );
 
@@ -1669,6 +2007,7 @@ export default function OrderEditorModal({
     product: TCategoryApiProduct,
     options?: {
       initialSelections?: Record<string, string[]>;
+      initialComboSelections?: Record<string, Record<string, number>>;
       initialComment?: string;
       editingLineId?: string | null;
     },
@@ -1690,6 +2029,7 @@ export default function OrderEditorModal({
 
     setModifierProduct(normalizedProduct);
     setModifierSelections(defaultSelections);
+    setComboSelectionsBySlot(options?.initialComboSelections ?? {});
     setItemComment(options?.initialComment?.trim() ?? "");
     setEditingCartItemLineId(options?.editingLineId ?? null);
     setModifierValidationError(null);
@@ -1698,6 +2038,7 @@ export default function OrderEditorModal({
   const closeModifierModal = () => {
     setModifierProduct(null);
     setModifierSelections({});
+    setComboSelectionsBySlot({});
     setItemComment("");
     setEditingCartItemLineId(null);
     setModifierValidationError(null);
@@ -1761,6 +2102,60 @@ export default function OrderEditorModal({
     return null;
   };
 
+  const validateComboSelections = (product: TCategoryApiProduct) => {
+    for (const slot of getComboSlots(product)) {
+      const optionCounts = comboSelectionsBySlot[slot.id] ?? {};
+      const totalSelected = Object.values(optionCounts).reduce((sum, quantity) => sum + quantity, 0);
+
+      if (totalSelected < slot.minSelect) {
+        return `Selecione ${slot.minSelect} item(ns) em ${getComboSlotTitle(slot)}`;
+      }
+
+      if (totalSelected > slot.maxSelect) {
+        return `Selecione no máximo ${slot.maxSelect} item(ns) em ${getComboSlotTitle(slot)}`;
+      }
+    }
+
+    return null;
+  };
+
+  const updateComboOptionQuantity = (
+    slot: TComboSlot,
+    option: TComboSlotOption,
+    delta: number,
+  ) => {
+    setComboSelectionsBySlot((previous) => {
+      const currentSlotSelections = previous[slot.id] ?? {};
+      const currentQuantity = currentSlotSelections[option.productId] ?? 0;
+      const totalSelected = Object.values(currentSlotSelections).reduce((sum, quantity) => sum + quantity, 0);
+      const nextQuantity = Math.max(0, currentQuantity + delta);
+
+      if (delta > 0) {
+        if (!slot.allowDuplicates && currentQuantity >= 1) {
+          return previous;
+        }
+
+        if (totalSelected >= slot.maxSelect) {
+          return previous;
+        }
+      }
+
+      const nextSlotSelections = { ...currentSlotSelections };
+      if (nextQuantity <= 0) {
+        delete nextSlotSelections[option.productId];
+      } else {
+        nextSlotSelections[option.productId] = nextQuantity;
+      }
+
+      return {
+        ...previous,
+        [slot.id]: nextSlotSelections,
+      };
+    });
+
+    setModifierValidationError(null);
+  };
+
   const applyModifiersAndAddProduct = () => {
     if (!modifierProduct) return;
 
@@ -1770,12 +2165,20 @@ export default function OrderEditorModal({
       return;
     }
 
+    const comboValidationError = validateComboSelections(modifierProduct);
+    if (comboValidationError) {
+      setModifierValidationError(comboValidationError);
+      return;
+    }
+
     if (editingCartItemLineId) {
       const normalizedComment = itemComment.trim();
       const selectedModifiers = getSelectedModifiers(modifierProduct, modifierSelections);
-      const nextSignature = buildModifierSignature(
+      const comboSelections = getSelectedComboEntries(modifierProduct, comboSelectionsBySlot);
+      const nextSignature = buildCartItemSignature(
         modifierProduct,
         modifierSelections,
+        comboSelectionsBySlot,
         normalizedComment,
       );
 
@@ -1804,6 +2207,7 @@ export default function OrderEditorModal({
                 productId: modifierProduct.id,
                 product: modifierProduct,
                 selectedModifiers,
+                comboSelections,
                 comment: normalizedComment || undefined,
               }
             : item,
@@ -1815,7 +2219,7 @@ export default function OrderEditorModal({
       return;
     }
 
-    addProductToCart(modifierProduct, modifierSelections, itemComment);
+    addProductToCart(modifierProduct, modifierSelections, comboSelectionsBySlot, itemComment);
     closeModifierModal();
   };
 
@@ -1830,9 +2234,11 @@ export default function OrderEditorModal({
       modifierGroups: normalizedGroups,
     };
     const initialSelections = getSelectedByGroupForProductFromCartItem(item, normalizedProduct);
+    const initialComboSelections = getComboSelectionsBySlotFromCartItem(item);
 
     openModifierModal(normalizedProduct, {
       initialSelections,
+      initialComboSelections,
       initialComment: item.comment,
       editingLineId: item.lineId,
     });
@@ -1971,16 +2377,26 @@ export default function OrderEditorModal({
         const requestBody: TCreateOrderRequestBody = {
           cart: {
             items: cartItems.map((item) => ({
-              cartId: item.lineId,
-              productId: item.productId,
-              quantity: item.quantity,
-              modifiers: item.selectedModifiers.map((modifier) => ({
-                modifierId: modifier.groupId,
-                modifierItemId: modifier.itemId,
-              })),
-              ...(item.comment ? { description: item.comment } : {}),
-            })),
-          },
+                  cartId: item.lineId,
+                  productId: item.productId,
+                  quantity: item.quantity,
+                  modifiers: item.selectedModifiers.map((modifier) => ({
+                    modifierId: modifier.groupId,
+                    modifierItemId: modifier.itemId,
+                  })),
+                  ...(item.comboSelections.length > 0
+                    ? {
+                        comboSelections: item.comboSelections.map((selection) => ({
+                          slotId: selection.slotId,
+                          optionProductId: selection.optionProductId,
+                          quantity: selection.quantity,
+                        })),
+                      }
+                    : {}),
+                  ...(item.comment ? { description: item.comment } : {}),
+                })),
+              },
+          source: "POS",
           customerId: selectedCustomerId,
           orderType,
           paymentMethod,
@@ -2036,6 +2452,15 @@ export default function OrderEditorModal({
             selectedModifierGroupItemIds: Array.from(
               new Set(item.selectedModifiers.map((modifier) => modifier.itemId))
             ),
+            ...(item.comboSelections.length > 0
+              ? {
+                  comboSelections: item.comboSelections.map((selection) => ({
+                    slotId: selection.slotId,
+                    optionProductId: selection.optionProductId,
+                    quantity: selection.quantity,
+                  })),
+                }
+              : {}),
           };
 
           if (initialIdsSet.has(item.lineId)) {
@@ -2208,6 +2633,53 @@ export default function OrderEditorModal({
         <View style={styles.body}>
           <View style={styles.productsSection}>
             <View style={styles.categoryTabsContainer}>
+              {promotionsLoading ? (
+                <Text style={styles.feedbackText}>Carregando promoções...</Text>
+              ) : promotionsError ? (
+                <Text style={styles.errorText}>{promotionsError}</Text>
+              ) : promotions.length > 0 ? (
+                <View style={styles.promotionSection}>
+                  <Text style={styles.promotionSectionTitle}>Promoções do POS</Text>
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.promotionRow}
+                  >
+                    {promotions.map((promotion) => (
+                      <View key={promotion.id} style={styles.promotionCard}>
+                        <Text style={styles.promotionName}>{promotion.name}</Text>
+                        <View style={styles.promotionProductsWrap}>
+                          {promotion.products.map((promotionProduct) => {
+                            const resolvedName =
+                              promotionProduct.translations?.pt?.title ??
+                              promotionProduct.name ??
+                              "Produto";
+                            const price =
+                              typeof promotionProduct.price === "number" &&
+                              Number.isFinite(promotionProduct.price)
+                                ? promotionProduct.price
+                                : 0;
+
+                            return (
+                              <Pressable
+                                key={`${promotion.id}-${promotionProduct.id}`}
+                                style={styles.promotionProductChip}
+                                onPress={() => handlePromotionProductPress(promotionProduct)}
+                              >
+                                <Text style={styles.promotionProductChipTitle}>{resolvedName}</Text>
+                                <Text style={styles.promotionProductChipPrice}>
+                                  {formatCurrency(price)}
+                                </Text>
+                              </Pressable>
+                            );
+                          })}
+                        </View>
+                      </View>
+                    ))}
+                  </ScrollView>
+                </View>
+              ) : null}
+
               <ScrollView
                 horizontal
                 showsHorizontalScrollIndicator={false}
@@ -2414,6 +2886,16 @@ export default function OrderEditorModal({
                             <Text style={styles.orderItemModifiersText}>
                               {item.selectedModifiers
                                 .map((modifier) => `${modifier.groupTitle}: ${modifier.itemName}`)
+                                .join(" • ")}
+                            </Text>
+                          )}
+                          {item.comboSelections.length > 0 && (
+                            <Text style={styles.orderItemModifiersText}>
+                              {item.comboSelections
+                                .map(
+                                  (selection) =>
+                                    `${selection.slotName}: ${selection.quantity}x ${selection.optionProductName}`,
+                                )
                                 .join(" • ")}
                             </Text>
                           )}
@@ -2972,9 +3454,67 @@ export default function OrderEditorModal({
                 </Pressable>
               </View>
               <ScrollView style={styles.modifierBody} contentContainerStyle={styles.modifierBodyContent}>
-                {renderableModifierGroups.length === 0 && (
+                {renderableModifierGroups.length === 0 &&
+                  (modifierProduct?.comboSlots?.length ?? 0) === 0 && (
                   <Text style={styles.feedbackText}>No modifiers available for this product.</Text>
                 )}
+                {getComboSlots(modifierProduct ?? { comboSlots: [] }).map((slot) => {
+                  const optionCounts = comboSelectionsBySlot[slot.id] ?? {};
+                  const totalSelected = Object.values(optionCounts).reduce(
+                    (sum, quantity) => sum + quantity,
+                    0,
+                  );
+
+                  return (
+                    <View key={slot.id} style={styles.modifierGroupBlock}>
+                      <View style={styles.modifierGroupHeader}>
+                        <Text style={styles.modifierGroupTitle}>{getComboSlotTitle(slot)}</Text>
+                        <Text style={styles.modifierGroupHint}>
+                          {`${totalSelected}/${slot.maxSelect}`}{slot.minSelect > 0 ? ` • mín ${slot.minSelect}` : ""}
+                        </Text>
+                      </View>
+
+                      <View style={styles.comboOptionsWrap}>
+                        {slot.options.map((option) => {
+                          const quantity = optionCounts[option.productId] ?? 0;
+                          const optionTitle = getComboOptionTitle(option);
+                          const extraPrice =
+                            typeof option.extraPrice === "number" && Number.isFinite(option.extraPrice)
+                              ? option.extraPrice
+                              : 0;
+
+                          return (
+                            <View key={`${slot.id}-${option.productId}`} style={styles.comboOptionRow}>
+                              <View style={styles.comboOptionInfo}>
+                                <Text style={styles.comboOptionTitle}>{optionTitle}</Text>
+                                {extraPrice > 0 ? (
+                                  <Text style={styles.comboOptionPrice}>
+                                    +{formatCurrency(extraPrice)}
+                                  </Text>
+                                ) : null}
+                              </View>
+                              <View style={styles.comboOptionControls}>
+                                <Pressable
+                                  style={styles.comboOptionButton}
+                                  onPress={() => updateComboOptionQuantity(slot, option, -1)}
+                                >
+                                  <Feather name="minus" size={14} color="#2d2d2d" />
+                                </Pressable>
+                                <Text style={styles.comboOptionQty}>{quantity}</Text>
+                                <Pressable
+                                  style={styles.comboOptionButton}
+                                  onPress={() => updateComboOptionQuantity(slot, option, 1)}
+                                >
+                                  <Feather name="plus" size={14} color="#2d2d2d" />
+                                </Pressable>
+                              </View>
+                            </View>
+                          );
+                        })}
+                      </View>
+                    </View>
+                  );
+                })}
                 {renderableModifierGroups.map((group) => {
                     const selectedIds = modifierSelections[group.id] ?? [];
                     const selectedSet = new Set(selectedIds);
@@ -3127,6 +3667,56 @@ const styles = StyleSheet.create({
     borderBottomColor: "#f0f1f3",
     borderTopColor: "#f0f1f3",
     paddingVertical: 10,
+  },
+  promotionSection: {
+    gap: 10,
+    paddingHorizontal: 12,
+    paddingBottom: 12,
+  },
+  promotionSectionTitle: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#1D2B3A",
+  },
+  promotionRow: {
+    gap: 10,
+    paddingRight: 8,
+  },
+  promotionCard: {
+    width: 260,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#F0D285",
+    backgroundColor: "#FFF8DD",
+    padding: 14,
+    gap: 12,
+  },
+  promotionName: {
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#7A5800",
+  },
+  promotionProductsWrap: {
+    gap: 8,
+  },
+  promotionProductChip: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E7C86E",
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    gap: 4,
+  },
+  promotionProductChipTitle: {
+    fontSize: 14,
+    fontWeight: "800",
+    color: "#1D2B3A",
+  },
+  promotionProductChipPrice: {
+    fontSize: 13,
+    fontWeight: "700",
+    color: "#8A6400",
   },
   categoryTabsScroll: {
     flexGrow: 0,
@@ -3858,6 +4448,57 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     flexWrap: "wrap",
     gap: 10,
+  },
+  comboOptionsWrap: {
+    gap: 10,
+  },
+  comboOptionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 12,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E4E7EC",
+    backgroundColor: "#FFFFFF",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+  },
+  comboOptionInfo: {
+    flex: 1,
+    gap: 3,
+  },
+  comboOptionTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: "#2d2d2d",
+  },
+  comboOptionPrice: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#8A6400",
+  },
+  comboOptionControls: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  comboOptionButton: {
+    width: 30,
+    height: 30,
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "#D6DCE5",
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#F8FAFC",
+  },
+  comboOptionQty: {
+    minWidth: 18,
+    textAlign: "center",
+    fontSize: 16,
+    fontWeight: "800",
+    color: "#2d2d2d",
   },
   commentBlock: {
     gap: 8,
