@@ -6,16 +6,14 @@ import type {
   TPreparationStepCategory,
   TPreparationStepTrack,
   TSnooze,
-  TTPreparationStepModifierTrack,
 } from "@/types/station";
 import Feather from "@expo/vector-icons/Feather";
-import React, { useEffect } from "react";
+import React, { useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import { addSnooze, getActiveSnooze } from "./stationUtils";
 
 type PreparationCategoryCardProps = {
   preparationCategory: TPreparationStepCategory;
-  onComplete: (preparationStepCategoryId: string) => void;
   onSnooze: (preparationStepCategoryId: string, snoozes: TSnooze[]) => void;
   onUpdateSteps: (preparationStepCategoryId: string, steps: TPreparationStepTrack[]) => void;
 };
@@ -23,27 +21,15 @@ type PreparationCategoryCardProps = {
 type PreparationTrackItemProps = {
   track: TPreparationStepTrack;
   onTrackChange: (updates: Partial<TPreparationStepTrack>) => void;
-  disabled: boolean;
 };
 
 type ModifierChecklistItemProps = {
   modifier?: TModifierGroupItem;
   completed: boolean;
   onPress: () => void;
-  disabled: boolean;
 };
 
-const getTrackCanComplete = (
-  track: TPreparationStepTrack,
-  commentsCompleted: boolean,
-  modifiers: TTPreparationStepModifierTrack[],
-) => {
-  const commentsReady = track.comments !== undefined ? commentsCompleted : true;
-  const modifiersReady =
-    modifiers.length > 0 ? modifiers.every((modifier) => !!modifier.completed) : true;
-
-  return commentsReady && modifiersReady;
-};
+const DELAY_MINUTE_OPTIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const CompletionIndicator: React.FC<{ completed: boolean }> = ({ completed }) => {
   return (
@@ -57,30 +43,16 @@ const ModifierChecklistItem: React.FC<ModifierChecklistItemProps> = ({
   modifier,
   completed,
   onPress,
-  disabled,
 }) => {
   return (
-    <Pressable
-      onPress={onPress}
-      disabled={disabled}
-      style={[
-        styles.trackInnerRow,
-        styles.trackSubItem,
-        completed && styles.completedContainer,
-        disabled && styles.disabledItem,
-      ]}
-    >
+    <Pressable onPress={onPress} style={[styles.trackInnerRow, styles.trackSubItem, completed && styles.completedContainer]}>
       <Text style={styles.trackText}>{modifier?.description}</Text>
       <CompletionIndicator completed={completed} />
     </Pressable>
   );
 };
 
-const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
-  track,
-  onTrackChange,
-  disabled,
-}) => {
+const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({ track, onTrackChange }) => {
   const commentsCompleted = !!track.completedComments;
   const modifiers = track.preparationStepModifiers || [];
   const modifiersStatus = modifiers.reduce((acc, modifierTrack) => {
@@ -88,30 +60,17 @@ const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
     return acc;
   }, {} as Record<string, boolean>);
 
-  const canComplete = getTrackCanComplete(track, commentsCompleted, modifiers);
-
-  useEffect(() => {
-    if (track.completed && !canComplete) {
-      onTrackChange({ completed: false });
-    }
-  }, [canComplete, track.completed, onTrackChange]);
-
   return (
     <View style={[styles.trackContainer, track.completed && styles.completedContainer]}>
       <Pressable
         onPress={() => {
-          if (disabled) return;
-
           if (track.completed) {
             onTrackChange({ completed: false });
             return;
           }
 
-          if (canComplete) {
-            onTrackChange({ completed: true });
-          }
+          onTrackChange({ completed: true });
         }}
-        disabled={disabled}
         style={[styles.trackInnerRow, styles.trackPressable]}
       >
         <Text style={styles.trackText}>
@@ -131,7 +90,6 @@ const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
                   key={modifier.id}
                   modifier={modifier.modifierGtroupItem}
                   completed={modifiersStatus[modifier.id]}
-                  disabled={disabled}
                   onPress={() => {
                     const updatedModifiers = modifiers.map((currentModifier) =>
                       currentModifier.id === modifier.id
@@ -139,15 +97,8 @@ const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
                         : currentModifier
                     );
 
-                    const nextCanComplete = getTrackCanComplete(
-                      track,
-                      commentsCompleted,
-                      updatedModifiers
-                    );
-
                     onTrackChange({
                       preparationStepModifiers: updatedModifiers,
-                      completed: nextCanComplete ? track.completed : false,
                     });
                   }}
                 />
@@ -160,26 +111,16 @@ const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
               <Text style={styles.detailsTitle}>Instruções extras</Text>
               <Pressable
                 onPress={() => {
-                  if (disabled) return;
-
                   const nextCommentsCompleted = !commentsCompleted;
-                  const nextCanComplete = getTrackCanComplete(
-                    track,
-                    nextCommentsCompleted,
-                    modifiers
-                  );
 
                   onTrackChange({
                     completedComments: nextCommentsCompleted,
-                    completed: nextCanComplete ? track.completed : false,
                   });
                 }}
-                disabled={disabled}
                 style={[
                   styles.trackInnerRow,
                   styles.trackSubItem,
                   track.completedComments && styles.completedContainer,
-                  disabled && styles.disabledItem,
                 ]}
               >
                 <Text style={styles.trackText}>{track.comments}</Text>
@@ -195,10 +136,10 @@ const PreparationTrackItem: React.FC<PreparationTrackItemProps> = ({
 
 const PreparationCategoryCard: React.FC<PreparationCategoryCardProps> = ({
   preparationCategory,
-  onComplete,
   onSnooze,
   onUpdateSteps,
 }) => {
+  const [isDelaySelectorOpen, setIsDelaySelectorOpen] = useState(false);
   const activeSnooze = getActiveSnooze(preparationCategory);
   const shouldShowSnoozeModal = !!activeSnooze.snooze;
 
@@ -222,14 +163,42 @@ const PreparationCategoryCard: React.FC<PreparationCategoryCardProps> = ({
     onSnooze(preparationCategory.id, newSnoozes);
   });
 
-  const canComplete = preparationCategory.steps.every((track) => track.completed);
-
   return (
-    <View style={[styles.categoryContainer, preparationCategory.completed && styles.reducedOpacity]}>
+    <View style={styles.categoryContainer}>
       {shouldShowSnoozeModal && (
         <Pressable onPress={handleCancelSnooze} style={styles.snoozedModal}>
           <SnoozeCountdown snooze={activeSnooze.snooze} />
         </Pressable>
+      )}
+
+      {isDelaySelectorOpen && (
+        <View style={styles.delaySelectorOverlay}>
+          <Pressable style={styles.delaySelectorBackdrop} onPress={() => setIsDelaySelectorOpen(false)} />
+          <View style={styles.delaySelectorCard}>
+            <Text style={styles.delaySelectorTitle}>Adiar por quanto tempo?</Text>
+            <View style={styles.delaySelectorOptions}>
+              {DELAY_MINUTE_OPTIONS.map((minutes) => (
+                <Pressable
+                  key={`delay-${preparationCategory.id}-${minutes}`}
+                  onPress={() => {
+                    const newSnoozes = addSnooze(preparationCategory.snoozes, minutes * 60);
+                    onSnooze(preparationCategory.id, newSnoozes);
+                    setIsDelaySelectorOpen(false);
+                  }}
+                  style={styles.delayOptionButton}
+                >
+                  <Text style={styles.delayOptionButtonText}>{minutes} min</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable
+              style={styles.delaySelectorCancelButton}
+              onPress={() => setIsDelaySelectorOpen(false)}
+            >
+              <Text style={styles.delaySelectorCancelButtonText}>Cancelar</Text>
+            </Pressable>
+          </View>
+        </View>
       )}
 
       <View style={[styles.categoryNameContainer, shouldShowSnoozeModal && styles.reducedOpacity]}>
@@ -241,7 +210,6 @@ const PreparationCategoryCard: React.FC<PreparationCategoryCardProps> = ({
           <PreparationTrackItem
             key={item.id}
             track={item}
-            disabled={preparationCategory.completed}
             onTrackChange={(updates) => {
               const updatedSteps = preparationCategory.steps.map((step) =>
                 step.id === item.id ? { ...step, ...updates } : step
@@ -254,31 +222,11 @@ const PreparationCategoryCard: React.FC<PreparationCategoryCardProps> = ({
 
       <View style={[styles.categoryButtonContainer, shouldShowSnoozeModal && styles.reducedOpacity]}>
         <Pressable
-          onPress={() => {
-            const newSnoozes = addSnooze(preparationCategory.snoozes, 60);
-            onSnooze(preparationCategory.id, newSnoozes);
-          }}
+          onPress={() => setIsDelaySelectorOpen(true)}
           style={[styles.button, styles.snoozeButton]}
         >
           <Feather name="clock" size={22} color={Colors.light.text} />
           <Text style={styles.buttonText}>Adiar</Text>
-        </Pressable>
-
-        <Pressable
-          onPress={() => onComplete(preparationCategory.id)}
-          disabled={!canComplete}
-          style={[
-            styles.button,
-            styles.completeButton,
-            !canComplete && styles.disabledCompleteButton,
-            styles.primaryButton,
-            preparationCategory.completed && styles.completedPrimaryButton,
-          ]}
-        >
-          <Feather name="check" size={22} color={Colors.light.background} />
-          <Text style={[styles.buttonText, styles.primaryButtonText]}>
-            {preparationCategory.completed ? "Pronto" : "Marcar como pronto"}
-          </Text>
         </Pressable>
       </View>
     </View>
@@ -326,8 +274,6 @@ const styles = StyleSheet.create({
     padding: 16,
     borderTopWidth: 1,
     borderColor: Colors.light.border,
-    flexDirection: "row",
-    gap: 12,
   },
   button: {
     paddingHorizontal: 16,
@@ -352,7 +298,7 @@ const styles = StyleSheet.create({
     borderColor: Colors.light.tint,
   },
   snoozeButton: {
-    paddingHorizontal: 24,
+    width: "100%",
   },
   completeButton: {
     flex: 1,
@@ -399,9 +345,6 @@ const styles = StyleSheet.create({
     backgroundColor: "#E6F8ED",
     borderColor: "#D2E9E0",
   },
-  disabledItem: {
-    opacity: 0.7,
-  },
   trackDetailsContainer: {
     paddingVertical: 12,
     paddingHorizontal: 16,
@@ -425,6 +368,65 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     borderWidth: 1,
     borderColor: Colors.light.border,
+  },
+  delaySelectorOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 4,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  delaySelectorBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "#00000044",
+  },
+  delaySelectorCard: {
+    width: "84%",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    backgroundColor: Colors.light.foreground,
+    padding: 16,
+    gap: 12,
+  },
+  delaySelectorTitle: {
+    fontSize: 18,
+    fontWeight: "700",
+    color: Colors.light.text,
+  },
+  delaySelectorOptions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+  },
+  delayOptionButton: {
+    minWidth: 76,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    backgroundColor: Colors.light.background,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  delayOptionButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: Colors.light.text,
+  },
+  delaySelectorCancelButton: {
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: Colors.light.border,
+    backgroundColor: Colors.light.background,
+    paddingVertical: 10,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  delaySelectorCancelButtonText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#555555",
   },
 });
 

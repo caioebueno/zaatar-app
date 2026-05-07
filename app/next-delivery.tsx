@@ -1,3 +1,5 @@
+import { API_BASE_URL } from "@/constants/api";
+import { calculateOrderTotal } from "@/utils/orderTotal";
 import Feather from "@expo/vector-icons/Feather";
 import { router, useLocalSearchParams } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
@@ -6,10 +8,25 @@ import { SafeAreaView } from "react-native-safe-area-context";
 
 const DEFAULT_DRIVER_ID = "a9fa0c74-ae00-4c4c-b506-d82a0ed0c748";
 const DEFAULT_DRIVER_NAME = "Paula";
-const API_BASE_URL =
-  process.env.EXPO_PUBLIC_API_BASE_URL ??
-  (Platform.OS === "web" ? "http://localhost:3000/api" : "http://192.168.1.151:3000/api");
 const NEXT_DISPATCH_POLL_INTERVAL_MS = 10000;
+const SQUARE_POS_CLIENT_ID = (process.env.EXPO_PUBLIC_SQUARE_POS_CLIENT_ID ?? "").trim();
+const SQUARE_POS_CALLBACK_URL = (
+  process.env.EXPO_PUBLIC_SQUARE_POS_CALLBACK_URL ?? "zaatarapp://square-pos"
+).trim();
+const SQUARE_POS_LOCATION_ID = (process.env.EXPO_PUBLIC_SQUARE_POS_LOCATION_ID ?? "").trim();
+const SQUARE_POS_CURRENCY_CODE = (
+  process.env.EXPO_PUBLIC_SQUARE_POS_CURRENCY_CODE ?? "USD"
+)
+  .trim()
+  .toUpperCase();
+const SQUARE_POS_IOS_API_VERSION = (
+  process.env.EXPO_PUBLIC_SQUARE_POS_IOS_API_VERSION ?? "1.3"
+).trim();
+const SQUARE_POS_ANDROID_API_VERSION = (
+  process.env.EXPO_PUBLIC_SQUARE_POS_ANDROID_API_VERSION ?? "v2.0"
+).trim();
+const SQUARE_POS_ANDROID_PLAY_STORE_URL =
+  "https://play.google.com/store/apps/details?id=com.squareup";
 
 type TNextDispatchOrderProduct = {
   id: string;
@@ -26,25 +43,59 @@ type TNextDispatchOrder = {
   id: string;
   createdAt: string;
   number?: string;
+  type?: "DELIVERY" | "TAKEAWAY";
   delivered: boolean;
   paidAt?: string | null;
   deliveredAt?: string | null;
+  tip?: number | null;
+  tipAmount?: number | null;
   paymentMethod: "CARD" | "CASH" | "ZELLE";
+  progressiveDiscountSnapshot?: {
+    fullPrice?: number | null;
+    discountedPrice?: number | null;
+    discountAmount?: number | null;
+    selectedPrize?: {
+      prizeId?: string;
+      prizeName?: string;
+      quantity?: number | null;
+      selectedProductIds?: string[];
+      selectedProductCounts?: {
+        productId: string;
+        quantity: number;
+      }[];
+      availableProducts?: {
+        id: string;
+        name: string;
+      }[];
+    } | null;
+  } | null;
+  redeemedRewards?: {
+    id: string;
+    quantity?: number | null;
+    title?: string | null;
+    product?: {
+      id: string;
+      name: string;
+    } | null;
+  }[];
   deliveryAddress?: {
     id: string;
     description?: string;
     street?: string;
     number?: string;
     complement?: string;
+    numberComplement?: string;
     city?: string;
     state?: string;
     zipCode?: string;
     lat?: string;
     lng?: string;
+    deliveryFee?: number;
   } | null;
   customer?: {
     id: string;
     name: string;
+    phone?: string | null;
   } | null;
   orderProducts: TNextDispatchOrderProduct[];
 };
@@ -63,6 +114,18 @@ type TOrderUpdatePayload = {
   paidAt?: string | null;
   paymentMethod?: "CARD" | "CASH" | "ZELLE";
   deliveredAt?: string | null;
+};
+
+type TProgressiveDiscountStep = {
+  id: string;
+  type: "PERCENTAGEDISCOUNT" | "GIFT" | string;
+  amount: number;
+  discount?: number | null;
+};
+
+type TProgressiveDiscount = {
+  id: string;
+  steps: TProgressiveDiscountStep[];
 };
 
 async function fetchNextDispatch(driverId: string) {
@@ -114,6 +177,17 @@ function formatAddress(order: TNextDispatchOrder | null) {
   return `${base || "Endereço indisponível"}`;
 }
 
+function formatDeliveryInstruction(order: TNextDispatchOrder | null) {
+  if (!order?.deliveryAddress) return null;
+
+  const parts = [order.deliveryAddress.complement, order.deliveryAddress.numberComplement]
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter((value) => value.length > 0);
+
+  if (parts.length === 0) return null;
+  return Array.from(new Set(parts)).join(" ");
+}
+
 type TNavigationDestination = {
   query: string;
   lat?: number;
@@ -162,6 +236,89 @@ function formatCurrencyFromCents(valueInCents: number) {
   }).format(valueInCents / 100);
 }
 
+function getSquarePosOrderLabel(order: TNextDispatchOrder) {
+  return order.number ? `Pedido #${order.number}` : `Pedido ${order.id.slice(0, 6)}`;
+}
+
+function getSquarePosCustomerPhone(order: TNextDispatchOrder) {
+  const rawPhone = order.customer?.phone?.trim();
+  if (!rawPhone) return null;
+  return rawPhone;
+}
+
+function getSquarePosNote(order: TNextDispatchOrder) {
+  const orderLabel = getSquarePosOrderLabel(order);
+  const customerPhone = getSquarePosCustomerPhone(order);
+  if (!customerPhone) {
+    return orderLabel;
+  }
+
+  return `${orderLabel} | Cliente: ${customerPhone}`;
+}
+
+function buildSquareIosChargeUrl(order: TNextDispatchOrder, amountInCents: number) {
+  const requestData: Record<string, unknown> = {
+    amount_money: {
+      amount: amountInCents,
+      currency_code: SQUARE_POS_CURRENCY_CODE || "USD",
+    },
+    callback_url: SQUARE_POS_CALLBACK_URL,
+    client_id: SQUARE_POS_CLIENT_ID,
+    version: SQUARE_POS_IOS_API_VERSION || "1.3",
+    state: order.id,
+    notes: getSquarePosNote(order),
+    options: {
+      supported_tender_types: ["CREDIT_CARD"],
+      auto_return: true,
+    },
+  };
+
+  if (SQUARE_POS_LOCATION_ID) {
+    requestData.location_id = SQUARE_POS_LOCATION_ID;
+  }
+
+  return `square-commerce-v1://payment/create?data=${encodeURIComponent(JSON.stringify(requestData))}`;
+}
+
+function buildSquareAndroidChargeUrl(order: TNextDispatchOrder, amountInCents: number) {
+  const segments = [
+    "intent:#Intent",
+    "action=com.squareup.pos.action.CHARGE",
+    "package=com.squareup",
+    `S.browser_fallback_url=${SQUARE_POS_ANDROID_PLAY_STORE_URL}`,
+    `S.com.squareup.pos.WEB_CALLBACK_URI=${SQUARE_POS_CALLBACK_URL}`,
+    `S.com.squareup.pos.CLIENT_ID=${SQUARE_POS_CLIENT_ID}`,
+    `S.com.squareup.pos.API_VERSION=${SQUARE_POS_ANDROID_API_VERSION || "v2.0"}`,
+    `i.com.squareup.pos.TOTAL_AMOUNT=${amountInCents}`,
+    `S.com.squareup.pos.CURRENCY_CODE=${SQUARE_POS_CURRENCY_CODE || "USD"}`,
+    `S.com.squareup.pos.NOTE=${encodeURIComponent(getSquarePosNote(order))}`,
+    "S.com.squareup.pos.TENDER_TYPES=com.squareup.pos.TENDER_CARD",
+    `S.com.squareup.pos.REQUEST_METADATA=${order.id}`,
+  ];
+
+  if (SQUARE_POS_LOCATION_ID) {
+    segments.push(`S.com.squareup.pos.LOCATION_ID=${SQUARE_POS_LOCATION_ID}`);
+  }
+
+  segments.push("end");
+
+  return segments.join(";");
+}
+
+function isHttpsUrl(value: string) {
+  try {
+    const parsedUrl = new URL(value);
+    return parsedUrl.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isMobileWebDevice() {
+  if (typeof navigator === "undefined") return false;
+  return /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+}
+
 export default function NextDeliveryScreen() {
   const { driverId, driverName } = useLocalSearchParams<{
     driverId?: string;
@@ -177,9 +334,11 @@ export default function NextDeliveryScreen() {
       : DEFAULT_DRIVER_NAME;
 
   const [nextDispatch, setNextDispatch] = useState<TNextDispatch | null>(null);
+  const [progressiveDiscount, setProgressiveDiscount] = useState<TProgressiveDiscount | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [isUpdatingOrder, setIsUpdatingOrder] = useState(false);
+  const [isWebPaymentDropdownOpen, setIsWebPaymentDropdownOpen] = useState(false);
 
   useEffect(() => {
     let stopped = false;
@@ -224,6 +383,32 @@ export default function NextDeliveryScreen() {
     };
   }, [selectedDriverId]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadProgressiveDiscount = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/progressive-discount`);
+        if (!response.ok) {
+          throw new Error("Falha ao carregar desconto progressivo");
+        }
+
+        const data = (await response.json()) as TProgressiveDiscount | null;
+        if (cancelled) return;
+        setProgressiveDiscount(data);
+      } catch {
+        if (cancelled) return;
+        setProgressiveDiscount(null);
+      }
+    };
+
+    void loadProgressiveDiscount();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const pendingOrders = useMemo(
     () => (nextDispatch?.orders ?? []).filter((order) => !order.delivered),
     [nextDispatch]
@@ -234,12 +419,99 @@ export default function NextDeliveryScreen() {
   const upcomingOrders = pendingOrders.slice(1);
   const resolvedDriverName = nextDispatch?.driver?.name ?? selectedDriverName;
   const nextCustomerName = nextOrder?.customer?.name ?? "Sem cliente";
+  const nextCustomerPhone = nextOrder?.customer?.phone?.trim() ?? "";
   const nextAddress = formatAddress(nextOrder);
-  const nextInstruction = nextOrder?.deliveryAddress?.complement;
-  const orderItems = nextOrder?.orderProducts ?? [];
-  const orderTotal = orderItems.reduce(
-    (sum, product) => sum + (product.fullAmount ?? product.amount ?? 0),
-    0
+  const nextInstruction = formatDeliveryInstruction(nextOrder);
+  const displayItems = useMemo(() => {
+    if (!nextOrder) {
+      return [{ id: "fallback", quantity: 1, name: "Item do pedido" }];
+    }
+
+    const orderItems = nextOrder.orderProducts ?? [];
+    const regularItems = orderItems.map((item) => ({
+      id: item.id,
+      quantity: item.quantity,
+      name: item.product?.name ?? "Item sem nome",
+    }));
+
+    const rewardItems = (nextOrder.redeemedRewards ?? []).map((reward) => ({
+      id: `reward-${reward.id}`,
+      quantity:
+        typeof reward.quantity === "number" && Number.isFinite(reward.quantity) && reward.quantity > 0
+          ? Math.round(reward.quantity)
+          : 1,
+      name: reward.product?.name?.trim() || reward.title?.trim() || "Reward",
+    }));
+
+    const selectedPrize = nextOrder.progressiveDiscountSnapshot?.selectedPrize;
+    const availablePrizeProducts = selectedPrize?.availableProducts ?? [];
+    const prizeProductNameById = new Map(
+      availablePrizeProducts.map((product) => [product.id, product.name]),
+    );
+
+    const prizeItems =
+      (selectedPrize?.selectedProductCounts?.length ?? 0) > 0
+        ? (selectedPrize?.selectedProductCounts ?? []).map((selectedProduct, index) => ({
+            id: `prize-count-${selectedProduct.productId}-${index}`,
+            quantity:
+              typeof selectedProduct.quantity === "number" &&
+              Number.isFinite(selectedProduct.quantity) &&
+              selectedProduct.quantity > 0
+                ? Math.round(selectedProduct.quantity)
+                : 1,
+            name:
+              prizeProductNameById.get(selectedProduct.productId)?.trim() || "Prize item",
+          }))
+        : (() => {
+            if ((selectedPrize?.selectedProductIds?.length ?? 0) > 0) {
+              const countedProducts = new Map<string, number>();
+
+              for (const productId of selectedPrize?.selectedProductIds ?? []) {
+                countedProducts.set(productId, (countedProducts.get(productId) ?? 0) + 1);
+              }
+
+              return Array.from(countedProducts.entries()).map(([productId, quantity]) => ({
+                id: `prize-id-${productId}`,
+                quantity,
+                name: prizeProductNameById.get(productId)?.trim() || "Prize item",
+              }));
+            }
+
+            if (selectedPrize?.prizeName?.trim()) {
+              return [
+                {
+                  id: `prize-name-${selectedPrize.prizeId ?? "fallback"}`,
+                  quantity:
+                    typeof selectedPrize.quantity === "number" &&
+                    Number.isFinite(selectedPrize.quantity) &&
+                    selectedPrize.quantity > 0
+                      ? Math.round(selectedPrize.quantity)
+                      : 1,
+                  name: selectedPrize.prizeName.trim(),
+                },
+              ];
+            }
+
+            return [];
+          })();
+
+    const combinedItems = [...regularItems, ...rewardItems, ...prizeItems];
+    return combinedItems.length > 0
+      ? combinedItems
+      : [{ id: "fallback", quantity: 1, name: "Item do pedido" }];
+  }, [nextOrder]);
+  const orderTotal = calculateOrderTotal(
+    nextOrder
+      ? {
+          ...nextOrder,
+          progressiveDiscountAmount:
+            typeof nextOrder.progressiveDiscountSnapshot?.discountAmount === "number" &&
+            Number.isFinite(nextOrder.progressiveDiscountSnapshot.discountAmount)
+              ? nextOrder.progressiveDiscountSnapshot.discountAmount
+              : null,
+          progressiveDiscountSteps: progressiveDiscount?.steps,
+        }
+      : null
   );
 
   const handleStartNavigation = async () => {
@@ -310,6 +582,28 @@ export default function NextDeliveryScreen() {
     );
   };
 
+  const handleOpenCustomerWhatsApp = async () => {
+    if (!nextCustomerPhone) {
+      Alert.alert("Telefone indisponível", "Este cliente não possui telefone para contato.");
+      return;
+    }
+
+    const digitsOnly = nextCustomerPhone.replace(/\D/g, "");
+    if (!digitsOnly) {
+      Alert.alert("Telefone inválido", "Não foi possível abrir o WhatsApp para este número.");
+      return;
+    }
+
+    const phoneWithCountryCode = digitsOnly.length === 10 ? `1${digitsOnly}` : digitsOnly;
+    const whatsappUrl = `https://wa.me/${phoneWithCountryCode}`;
+
+    try {
+      await Linking.openURL(whatsappUrl);
+    } catch {
+      Alert.alert("Erro", "Não foi possível abrir o WhatsApp.");
+    }
+  };
+
   const replaceOrderInState = (updatedOrder: TNextDispatchOrder) => {
     setNextDispatch((previous) => {
       if (!previous) return previous;
@@ -338,57 +632,50 @@ export default function NextDeliveryScreen() {
   };
 
   const handleConfirmPayment = (order: TNextDispatchOrder) => {
+    if (Platform.OS === "web") {
+      setIsWebPaymentDropdownOpen((previous) => !previous);
+      return;
+    }
+
     Alert.alert("Confirma Pagamento", "Selecione o método de pagamento:", [
       {
         text: "Cartão",
         onPress: () => {
-          void (async () => {
-            setIsUpdatingOrder(true);
-            try {
-              const updatedOrder = await updateOrder(order.id, {
-                paymentMethod: "CARD",
-                paidAt: new Date().toISOString(),
-              });
-              replaceOrderInState(updatedOrder);
-              await refetchNextDispatch();
-            } catch (updateError) {
-              const message =
-                updateError instanceof Error
-                  ? updateError.message
-                  : "Falha ao confirmar pagamento";
-              Alert.alert("Erro", message);
-            } finally {
-              setIsUpdatingOrder(false);
-            }
-          })();
+          void handlePaymentMethodSelection(order, "CARD");
         },
       },
       {
         text: "Dinheiro",
         onPress: () => {
-          void (async () => {
-            setIsUpdatingOrder(true);
-            try {
-              const updatedOrder = await updateOrder(order.id, {
-                paymentMethod: "CASH",
-                paidAt: new Date().toISOString(),
-              });
-              replaceOrderInState(updatedOrder);
-              await refetchNextDispatch();
-            } catch (updateError) {
-              const message =
-                updateError instanceof Error
-                  ? updateError.message
-                  : "Falha ao confirmar pagamento";
-              Alert.alert("Erro", message);
-            } finally {
-              setIsUpdatingOrder(false);
-            }
-          })();
+          void handlePaymentMethodSelection(order, "CASH");
         },
       },
       { text: "Cancelar", style: "cancel" },
     ]);
+  };
+
+  const handlePaymentMethodSelection = async (
+    order: TNextDispatchOrder,
+    paymentMethod: "CARD" | "CASH"
+  ) => {
+    setIsUpdatingOrder(true);
+    setIsWebPaymentDropdownOpen(false);
+    try {
+      const updatedOrder = await updateOrder(order.id, {
+        paymentMethod,
+        paidAt: new Date().toISOString(),
+      });
+      replaceOrderInState(updatedOrder);
+      await refetchNextDispatch();
+    } catch (updateError) {
+      const message =
+        updateError instanceof Error
+          ? updateError.message
+          : "Falha ao confirmar pagamento";
+      Alert.alert("Erro", message);
+    } finally {
+      setIsUpdatingOrder(false);
+    }
   };
 
   const handleMarkDelivered = async (order: TNextDispatchOrder) => {
@@ -418,6 +705,84 @@ export default function NextDeliveryScreen() {
     }
 
     void handleMarkDelivered(nextOrder);
+  };
+
+  const handlePayWithCardInSquare = async () => {
+    if (!nextOrder || isUpdatingOrder) return;
+
+    setIsWebPaymentDropdownOpen(false);
+
+    if (!SQUARE_POS_CLIENT_ID) {
+      Alert.alert(
+        "Configuração pendente",
+        "Defina EXPO_PUBLIC_SQUARE_POS_CLIENT_ID para abrir o Square Point of Sale."
+      );
+      return;
+    }
+
+    const amountInCents = Math.round(orderTotal);
+    if (!Number.isFinite(amountInCents) || amountInCents <= 0) {
+      Alert.alert("Valor inválido", "Não foi possível identificar o valor do pedido.");
+      return;
+    }
+
+    let squareUrl = "";
+    if (Platform.OS === "ios") {
+      squareUrl = buildSquareIosChargeUrl(nextOrder, amountInCents);
+    } else if (Platform.OS === "android") {
+      squareUrl = buildSquareAndroidChargeUrl(nextOrder, amountInCents);
+    } else {
+      if (!isMobileWebDevice()) {
+        Alert.alert(
+          "Dispositivo não suportado",
+          "Use este botão em um celular para abrir o Square POS."
+        );
+        return;
+      }
+
+      if (!isHttpsUrl(SQUARE_POS_CALLBACK_URL)) {
+        Alert.alert(
+          "Configuração pendente",
+          "No PWA, EXPO_PUBLIC_SQUARE_POS_CALLBACK_URL precisa ser uma URL HTTPS."
+        );
+        return;
+      }
+
+      const userAgent = navigator.userAgent;
+      const isAndroid = /Android/i.test(userAgent);
+      squareUrl = isAndroid
+        ? buildSquareAndroidChargeUrl(nextOrder, amountInCents)
+        : buildSquareIosChargeUrl(nextOrder, amountInCents);
+    }
+
+    try {
+      if (Platform.OS === "web") {
+        window.location.href = squareUrl;
+      } else {
+        await Linking.openURL(squareUrl);
+      }
+    } catch {
+      if (Platform.OS === "android") {
+        try {
+          await Linking.openURL(SQUARE_POS_ANDROID_PLAY_STORE_URL);
+          return;
+        } catch {
+          // Falls back to generic error alert below.
+        }
+      }
+
+      if (Platform.OS === "web") {
+        Alert.alert(
+          "Square indisponível",
+          "Não foi possível abrir o Square POS. Verifique se está em um celular com o app Square instalado."
+        );
+      } else {
+        Alert.alert(
+          "Square indisponível",
+          "Não foi possível abrir o app Square Point of Sale neste dispositivo."
+        );
+      }
+    }
   };
 
   return (
@@ -470,14 +835,7 @@ export default function NextDeliveryScreen() {
             <View style={styles.itemsBlock}>
               <Text style={styles.itemsTitle}>Itens do Pedido</Text>
               <View style={styles.itemsList}>
-                {(orderItems.length > 0
-                  ? orderItems.map((item) => ({
-                    id: item.id,
-                    quantity: item.quantity,
-                    name: item.product?.name ?? "Item sem nome",
-                  }))
-                  : [{ id: "fallback", quantity: 1, name: "Item do pedido" }]
-                ).map((item) => (
+                {displayItems.map((item) => (
                   <View key={item.id} style={styles.itemRow}>
                     <View style={styles.quantityBadge}>
                       <Text style={styles.quantityText}>{item.quantity}x</Text>
@@ -499,6 +857,21 @@ export default function NextDeliveryScreen() {
                   {getPaymentMethodLabel(nextOrder.paymentMethod)}
                 </Text>
               </View>
+              <View style={styles.totalRow}>
+                <Text style={styles.totalLabel}>Status do pagamento</Text>
+                <View
+                  style={[
+                    styles.paymentStatusBadge,
+                    isNextOrderPaid
+                      ? styles.paymentStatusBadgePaid
+                      : styles.paymentStatusBadgePending,
+                  ]}
+                >
+                  <Text style={styles.paymentStatusBadgeText}>
+                    {isNextOrderPaid ? "Pago" : "Pendente"}
+                  </Text>
+                </View>
+              </View>
             </View>
 
             <View style={styles.actions}>
@@ -511,6 +884,21 @@ export default function NextDeliveryScreen() {
               >
                 <Feather name="navigation" size={18} color="#FFFFFF" />
                 <Text style={styles.primaryActionText}>Iniciar Navegação</Text>
+              </Pressable>
+
+              <Pressable
+                style={[
+                  styles.secondaryAction,
+                  (!nextOrder || !nextCustomerPhone || isUpdatingOrder) &&
+                    styles.secondaryActionDisabled,
+                ]}
+                onPress={() => {
+                  void handleOpenCustomerWhatsApp();
+                }}
+                disabled={!nextOrder || !nextCustomerPhone || isUpdatingOrder}
+              >
+                <Feather name="message-circle" size={18} color="#107550" />
+                <Text style={styles.secondaryActionText}>Conversar no WhatsApp</Text>
               </Pressable>
 
               <Pressable
@@ -530,6 +918,50 @@ export default function NextDeliveryScreen() {
                       : "Confirma Pagamento"}
                 </Text>
               </Pressable>
+              {!isNextOrderPaid && (
+                <Pressable
+                  style={[
+                    styles.secondaryAction,
+                    (!nextOrder || isUpdatingOrder) && styles.secondaryActionDisabled,
+                  ]}
+                  onPress={() => {
+                    void handlePayWithCardInSquare();
+                  }}
+                  disabled={!nextOrder || isUpdatingOrder}
+                >
+                  <Feather name="credit-card" size={18} color="#107550" />
+                  <Text style={styles.secondaryActionText}>Pagar com cartão</Text>
+                </Pressable>
+              )}
+              {Platform.OS === "web" && !isNextOrderPaid && isWebPaymentDropdownOpen && nextOrder && (
+                <View style={styles.webPaymentDropdown}>
+                  <Pressable
+                    style={styles.webPaymentOption}
+                    onPress={() => {
+                      void handlePaymentMethodSelection(nextOrder, "CARD");
+                    }}
+                    disabled={isUpdatingOrder}
+                  >
+                    <Text style={styles.webPaymentOptionText}>Cartão</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.webPaymentOption}
+                    onPress={() => {
+                      void handlePaymentMethodSelection(nextOrder, "CASH");
+                    }}
+                    disabled={isUpdatingOrder}
+                  >
+                    <Text style={styles.webPaymentOptionText}>Dinheiro</Text>
+                  </Pressable>
+                  <Pressable
+                    style={styles.webPaymentCancel}
+                    onPress={() => setIsWebPaymentDropdownOpen(false)}
+                    disabled={isUpdatingOrder}
+                  >
+                    <Text style={styles.webPaymentCancelText}>Cancelar</Text>
+                  </Pressable>
+                </View>
+              )}
             </View>
           </View>
         </View>
@@ -736,6 +1168,25 @@ const styles = StyleSheet.create({
     color: "#2D2D2D",
     fontWeight: "700",
   },
+  paymentStatusBadge: {
+    minWidth: 96,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  paymentStatusBadgePaid: {
+    backgroundColor: "#E6F8ED",
+  },
+  paymentStatusBadgePending: {
+    backgroundColor: "#FFF4DB",
+  },
+  paymentStatusBadgeText: {
+    fontSize: 15,
+    fontWeight: "700",
+    color: "#2D2D2D",
+  },
   actions: {
     gap: 12,
   },
@@ -773,6 +1224,38 @@ const styles = StyleSheet.create({
     fontSize: 18,
     fontWeight: "600",
     color: "#107550",
+  },
+  webPaymentDropdown: {
+    borderWidth: 1,
+    borderColor: "#DEDEDE",
+    borderRadius: 12,
+    backgroundColor: "#FFFFFF",
+    overflow: "hidden",
+  },
+  webPaymentOption: {
+    minHeight: 44,
+    paddingHorizontal: 14,
+    alignItems: "flex-start",
+    justifyContent: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#EDEDED",
+  },
+  webPaymentOptionText: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#2D2D2D",
+  },
+  webPaymentCancel: {
+    minHeight: 44,
+    paddingHorizontal: 14,
+    alignItems: "flex-start",
+    justifyContent: "center",
+    backgroundColor: "#F9F9F9",
+  },
+  webPaymentCancelText: {
+    fontSize: 15,
+    fontWeight: "600",
+    color: "#666666",
   },
   upcomingSection: {
     paddingHorizontal: 20,

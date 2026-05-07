@@ -1,0 +1,18 @@
+{
+  "buildCommand": "npx expo export --platform web",
+  "outputDirectory": "dist",
+  "cleanUrls": true,
+  "routes": [
+    {
+      "handle": "filesystem"
+    },
+    {
+      "src": "/.*",
+      "dest": "/index.html"
+    }
+  ],
+  "env": {
+    "EXPO_PUBLIC_API_BASE_URL": "https://www.zaatargrillpizza.com/",
+    "EXPO_PUBLIC_INVENTORY_API_BASE_URL": "https://www.zaatargrillpizza.com/api/inventory"
+  }
+}

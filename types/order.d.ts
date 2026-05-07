@@ -9,6 +9,8 @@ export type TOrderType = "DELIVERY" | "TAKEAWAY";
 export type TOrder = {
   id: string;
   createdAt: string;
+  productionIndex?: number;
+  scheduleFor?: string | null;
   number?: string;
   type: TOrderType;
   costumerId?: string;
