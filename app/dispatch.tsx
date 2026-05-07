@@ -43,6 +43,9 @@ type TDispatchOrder = {
     phone?: string | null;
   } | null;
   progressiveDiscountSnapshot?: {
+    fullPrice?: number | null;
+    discountedPrice?: number | null;
+    discountAmount?: number | null;
     selectedPrize?: {
       prizeId?: string;
       prizeName?: string;
@@ -58,6 +61,15 @@ type TDispatchOrder = {
       }[];
     } | null;
   } | null;
+  redeemedRewards?: {
+    id: string;
+    quantity?: number | null;
+    title?: string | null;
+    product?: {
+      id: string;
+      name: string;
+    } | null;
+  }[];
   deliveryAddress?: {
     id: string;
     createdAt: string;
@@ -717,6 +729,11 @@ function toOrderEditorInitialOrder(order: TDispatchOrder): TOrderEditorInitialOr
       typeof order.tipAmount === "number" && Number.isFinite(order.tipAmount)
         ? order.tipAmount
         : null,
+    progressiveDiscountAmount:
+      typeof order.progressiveDiscountSnapshot?.discountAmount === "number" &&
+      Number.isFinite(order.progressiveDiscountSnapshot.discountAmount)
+        ? order.progressiveDiscountSnapshot.discountAmount
+        : null,
     selectedPrize: order.progressiveDiscountSnapshot?.selectedPrize
       ? {
           prizeId: order.progressiveDiscountSnapshot.selectedPrize.prizeId,
@@ -788,8 +805,8 @@ function DispatchOrderCard({
     key: string;
     label: string;
     isPrize?: boolean;
+    isReward?: boolean;
   };
-  console.log(order)
   const customerName = order.customer?.name ?? FALLBACK_CUSTOMER;
   const customerPhone = order.customer?.phone?.trim() || null;
   const deliveryInstruction = formatDeliveryInstruction(order);
@@ -833,6 +850,18 @@ function DispatchOrderCard({
           label: "1x  Item do pedido",
         },
       ];
+
+  const rewardOrderItems: TDispatchOrderItemLine[] = (order.redeemedRewards ?? []).map(
+    (reward, index) => ({
+      key: `reward-${order.id}-${reward.id || index}`,
+      label: `${
+        typeof reward.quantity === "number" && Number.isFinite(reward.quantity) && reward.quantity > 0
+          ? Math.round(reward.quantity)
+          : 1
+      }x  ${reward.product?.name ?? reward.title ?? "Reward item"}`,
+      isReward: true,
+    }),
+  );
 
   const selectedPrize = order.progressiveDiscountSnapshot?.selectedPrize;
   const availablePrizeProducts = selectedPrize?.availableProducts ?? [];
@@ -879,7 +908,7 @@ function DispatchOrderCard({
     ];
   }
 
-  const orderItems = [...regularOrderItems, ...prizeOrderItems];
+  const orderItems = [...regularOrderItems, ...rewardOrderItems, ...prizeOrderItems];
   const hasOrderItems = orderItems.length > 0;
   const hasExpandableContent = hasOrderItems || showActionButton;
 
@@ -996,6 +1025,11 @@ function DispatchOrderCard({
                 {item.isPrize && (
                   <View style={styles.prizeBadge}>
                     <Text style={styles.prizeBadgeText}>Prize</Text>
+                  </View>
+                )}
+                {item.isReward && (
+                  <View style={styles.rewardBadge}>
+                    <Text style={styles.rewardBadgeText}>Reward</Text>
                   </View>
                 )}
               </View>
@@ -3279,6 +3313,19 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
     color: "#1e5da9",
+  },
+  rewardBadge: {
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: "#c8eed3",
+    backgroundColor: "#eefaf2",
+    paddingHorizontal: 6,
+    paddingVertical: 4,
+  },
+  rewardBadgeText: {
+    fontSize: 12,
+    fontWeight: "700",
+    color: "#1d7a43",
   },
   orderItemStatus: {
     fontSize: 12,

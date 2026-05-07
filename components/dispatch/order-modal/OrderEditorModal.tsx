@@ -77,6 +77,7 @@ type TCategoryApiProduct = {
   itemType?: string | null;
   price: number | null;
   comparedAtPrice?: number | null;
+  excludeFromProgressiveDiscount?: boolean;
   categoryIndex?: number | null;
   photos?: {
     id: string;
@@ -158,6 +159,7 @@ type TCartItem = {
   productId: string;
   product: TCategoryApiProduct;
   quantity: number;
+  excludeFromProgressiveDiscount: boolean;
   selectedModifiers: TCartSelectedModifier[];
   comboSelections: TCartComboSelection[];
   comment?: string;
@@ -178,6 +180,7 @@ export type TOrderEditorInitialOrder = {
   paymentMethod?: "CASH" | "CARD" | "ZELLE";
   tip?: number | null;
   tipAmount?: number | null;
+  progressiveDiscountAmount?: number | null;
   selectedPrize?: {
     prizeId?: string;
     prizeName?: string;
@@ -215,6 +218,7 @@ export type TOrderEditorInitialOrder = {
     productId: string;
     quantity?: number;
     amount?: number;
+    excludeFromProgressiveDiscount?: boolean;
     product?: {
       id?: string;
       name?: string;
@@ -585,6 +589,10 @@ function buildModifierSignature(
   return `${product.id}__${groups.join("|")}__comment:${normalizedComment}`;
 }
 
+function isProductExcludedFromProgressiveDiscount(product: TCategoryApiProduct | null | undefined) {
+  return !!product?.excludeFromProgressiveDiscount;
+}
+
 function buildCartItemSignature(
   product: TCategoryApiProduct,
   selectedByGroup: Record<string, string[]>,
@@ -593,7 +601,7 @@ function buildCartItemSignature(
 ) {
   const modifierSignature = buildModifierSignature(product, selectedByGroup, comment);
   const comboSignature = getComboSelectionsSignature(comboSelectionsBySlot, product.comboSlots);
-  return `${modifierSignature}__combo:${comboSignature}`;
+  return `${modifierSignature}__combo:${comboSignature}__deal:${isProductExcludedFromProgressiveDiscount(product) ? 1 : 0}`;
 }
 
 function getSelectionBounds(group: TModifierGroup) {
@@ -1186,6 +1194,13 @@ export default function OrderEditorModal({
     () => getRenderableModifierGroups(modifierProduct),
     [modifierProduct],
   );
+  const promotionProductIds = useMemo(
+    () =>
+      new Set(
+        promotions.flatMap((promotion) => promotion.products.map((product) => product.id)),
+      ),
+    [promotions],
+  );
   const tipAmount = useMemo(() => parseCurrencyInputToCents(tipInput), [tipInput]);
 
   useEffect(() => {
@@ -1304,6 +1319,9 @@ export default function OrderEditorModal({
             name: resolvedName,
             itemType: categoryProduct?.itemType ?? null,
             price: inferredUnitPrice,
+            excludeFromProgressiveDiscount:
+              orderProduct.excludeFromProgressiveDiscount ??
+              promotionProductIds.has(orderProduct.productId),
             photos:
               (orderProduct.product?.photos ?? []).length > 0
                 ? orderProduct.product?.photos
@@ -1323,6 +1341,7 @@ export default function OrderEditorModal({
             productId: orderProduct.productId,
             product: mappedProduct,
             quantity: fallbackQuantity,
+            excludeFromProgressiveDiscount: isProductExcludedFromProgressiveDiscount(mappedProduct),
             selectedModifiers: mappedModifiers,
             comboSelections: (orderProduct.comboSelections ?? []).map((selection) => ({
               slotId: selection.slotId,
@@ -1347,12 +1366,30 @@ export default function OrderEditorModal({
         (total, item) => total + item.quantity * getCartItemUnitPrice(item),
         0,
       );
+      const mappedEligibleSubtotal = mappedCartItems.reduce(
+        (total, item) =>
+          item.excludeFromProgressiveDiscount
+            ? total
+            : total + item.quantity * getCartItemUnitPrice(item),
+        0,
+      );
       const initialTipPercentage =
         typeof initialOrder.tip === "number" && Number.isFinite(initialOrder.tip)
           ? initialOrder.tip
           : null;
+      const initialProgressiveDiscountAmount =
+        typeof initialOrder.progressiveDiscountAmount === "number" &&
+        Number.isFinite(initialOrder.progressiveDiscountAmount)
+          ? Math.max(0, Math.round(initialOrder.progressiveDiscountAmount))
+          : calculateProgressiveDiscountAmount(
+              mappedEligibleSubtotal,
+              getAppliedProgressiveDiscountPercent(
+                getReachedProgressiveSteps(progressiveDiscount?.steps, mappedEligibleSubtotal),
+              ),
+            );
+      const discountedSubtotal = Math.max(0, mappedSubtotal - initialProgressiveDiscountAmount);
       const tipFromPercentage = calculateTipAmountFromPercentage(
-        mappedSubtotal,
+        discountedSubtotal,
         initialTipPercentage ?? 0,
       );
       const tipFromAmount =
@@ -1440,7 +1477,7 @@ export default function OrderEditorModal({
       setCreateOrderError(null);
       setSelectedCategoryId(ALL_CATEGORY_ID);
     }
-  }, [categories, initialOrder, mode, visible]);
+  }, [categories, initialOrder, mode, progressiveDiscount?.steps, promotionProductIds, visible]);
 
   useEffect(() => {
     if (!visible || mode !== "update") return;
@@ -1450,9 +1487,16 @@ export default function OrderEditorModal({
       (total, item) => total + item.quantity * getCartItemUnitPrice(item),
       0,
     );
-    const reachedSteps = getReachedProgressiveSteps(progressiveDiscount?.steps, cartSubtotal);
+    const eligibleSubtotal = cartItems.reduce(
+      (total, item) =>
+        item.excludeFromProgressiveDiscount
+          ? total
+          : total + item.quantity * getCartItemUnitPrice(item),
+      0,
+    );
+    const reachedSteps = getReachedProgressiveSteps(progressiveDiscount?.steps, eligibleSubtotal);
     const discountPercent = getAppliedProgressiveDiscountPercent(reachedSteps);
-    const discountAmount = calculateProgressiveDiscountAmount(cartSubtotal, discountPercent);
+    const discountAmount = calculateProgressiveDiscountAmount(eligibleSubtotal, discountPercent);
     const discountedSubtotal = Math.max(0, cartSubtotal - discountAmount);
     const computedTipAmount = calculateTipAmountFromPercentage(
       discountedSubtotal,
@@ -1760,9 +1804,20 @@ export default function OrderEditorModal({
       ),
     [cartItems],
   );
+  const progressiveDiscountEligibleSubtotal = useMemo(
+    () =>
+      cartItems.reduce(
+        (total, item) =>
+          item.excludeFromProgressiveDiscount
+            ? total
+            : total + item.quantity * getCartItemUnitPrice(item),
+        0,
+      ),
+    [cartItems],
+  );
   const reachedProgressiveSteps = useMemo(
-    () => getReachedProgressiveSteps(progressiveDiscount?.steps, subtotal),
-    [progressiveDiscount?.steps, subtotal],
+    () => getReachedProgressiveSteps(progressiveDiscount?.steps, progressiveDiscountEligibleSubtotal),
+    [progressiveDiscount?.steps, progressiveDiscountEligibleSubtotal],
   );
   const giftOrderItems = useMemo(
     () => {
@@ -1823,8 +1878,8 @@ export default function OrderEditorModal({
     [reachedProgressiveSteps],
   );
   const progressiveDiscountAmount = useMemo(
-    () => calculateProgressiveDiscountAmount(subtotal, progressiveDiscountPercent),
-    [progressiveDiscountPercent, subtotal],
+    () => calculateProgressiveDiscountAmount(progressiveDiscountEligibleSubtotal, progressiveDiscountPercent),
+    [progressiveDiscountEligibleSubtotal, progressiveDiscountPercent],
   );
   const deliveryFee = useMemo(() => {
     if (orderType !== "DELIVERY") return 0;
@@ -1848,6 +1903,7 @@ export default function OrderEditorModal({
         orderProducts: cartItems.map((item) => ({
           fullAmount: getCartItemUnitPrice(item),
           quantity: item.quantity,
+          excludeFromProgressiveDiscount: item.excludeFromProgressiveDiscount,
         })),
         progressiveDiscountSteps: progressiveDiscount?.steps,
       }),
@@ -1876,7 +1932,10 @@ export default function OrderEditorModal({
   const buildPromotionProduct = (promotionProduct: TPosExclusivePromotionProduct) => {
     const categoryProduct = getCategoryProductById(categories, promotionProduct.id);
     if (categoryProduct) {
-      return categoryProduct;
+      return {
+        ...categoryProduct,
+        excludeFromProgressiveDiscount: true,
+      };
     }
 
     const normalizedComboSlots = normalizeComboSlots(
@@ -1904,6 +1963,7 @@ export default function OrderEditorModal({
         Number.isFinite(promotionProduct.comparedAtPrice)
           ? promotionProduct.comparedAtPrice
           : null,
+      excludeFromProgressiveDiscount: true,
       photos: promotionProduct.photos ?? [],
       modifierGroups: [],
       comboSlots: normalizedComboSlots,
@@ -1948,6 +2008,7 @@ export default function OrderEditorModal({
           productId: product.id,
           product,
           quantity: 1,
+          excludeFromProgressiveDiscount: isProductExcludedFromProgressiveDiscount(product),
           selectedModifiers,
           comboSelections,
           comment: normalizedComment || undefined,
@@ -2206,6 +2267,8 @@ export default function OrderEditorModal({
                 signature: nextSignature,
                 productId: modifierProduct.id,
                 product: modifierProduct,
+                excludeFromProgressiveDiscount:
+                  isProductExcludedFromProgressiveDiscount(modifierProduct),
                 selectedModifiers,
                 comboSelections,
                 comment: normalizedComment || undefined,

@@ -50,6 +50,34 @@ type TNextDispatchOrder = {
   tip?: number | null;
   tipAmount?: number | null;
   paymentMethod: "CARD" | "CASH" | "ZELLE";
+  progressiveDiscountSnapshot?: {
+    fullPrice?: number | null;
+    discountedPrice?: number | null;
+    discountAmount?: number | null;
+    selectedPrize?: {
+      prizeId?: string;
+      prizeName?: string;
+      quantity?: number | null;
+      selectedProductIds?: string[];
+      selectedProductCounts?: {
+        productId: string;
+        quantity: number;
+      }[];
+      availableProducts?: {
+        id: string;
+        name: string;
+      }[];
+    } | null;
+  } | null;
+  redeemedRewards?: {
+    id: string;
+    quantity?: number | null;
+    title?: string | null;
+    product?: {
+      id: string;
+      name: string;
+    } | null;
+  }[];
   deliveryAddress?: {
     id: string;
     description?: string;
@@ -394,11 +422,93 @@ export default function NextDeliveryScreen() {
   const nextCustomerPhone = nextOrder?.customer?.phone?.trim() ?? "";
   const nextAddress = formatAddress(nextOrder);
   const nextInstruction = formatDeliveryInstruction(nextOrder);
-  const orderItems = nextOrder?.orderProducts ?? [];
+  const displayItems = useMemo(() => {
+    if (!nextOrder) {
+      return [{ id: "fallback", quantity: 1, name: "Item do pedido" }];
+    }
+
+    const orderItems = nextOrder.orderProducts ?? [];
+    const regularItems = orderItems.map((item) => ({
+      id: item.id,
+      quantity: item.quantity,
+      name: item.product?.name ?? "Item sem nome",
+    }));
+
+    const rewardItems = (nextOrder.redeemedRewards ?? []).map((reward) => ({
+      id: `reward-${reward.id}`,
+      quantity:
+        typeof reward.quantity === "number" && Number.isFinite(reward.quantity) && reward.quantity > 0
+          ? Math.round(reward.quantity)
+          : 1,
+      name: reward.product?.name?.trim() || reward.title?.trim() || "Reward",
+    }));
+
+    const selectedPrize = nextOrder.progressiveDiscountSnapshot?.selectedPrize;
+    const availablePrizeProducts = selectedPrize?.availableProducts ?? [];
+    const prizeProductNameById = new Map(
+      availablePrizeProducts.map((product) => [product.id, product.name]),
+    );
+
+    const prizeItems =
+      (selectedPrize?.selectedProductCounts?.length ?? 0) > 0
+        ? (selectedPrize?.selectedProductCounts ?? []).map((selectedProduct, index) => ({
+            id: `prize-count-${selectedProduct.productId}-${index}`,
+            quantity:
+              typeof selectedProduct.quantity === "number" &&
+              Number.isFinite(selectedProduct.quantity) &&
+              selectedProduct.quantity > 0
+                ? Math.round(selectedProduct.quantity)
+                : 1,
+            name:
+              prizeProductNameById.get(selectedProduct.productId)?.trim() || "Prize item",
+          }))
+        : (() => {
+            if ((selectedPrize?.selectedProductIds?.length ?? 0) > 0) {
+              const countedProducts = new Map<string, number>();
+
+              for (const productId of selectedPrize?.selectedProductIds ?? []) {
+                countedProducts.set(productId, (countedProducts.get(productId) ?? 0) + 1);
+              }
+
+              return Array.from(countedProducts.entries()).map(([productId, quantity]) => ({
+                id: `prize-id-${productId}`,
+                quantity,
+                name: prizeProductNameById.get(productId)?.trim() || "Prize item",
+              }));
+            }
+
+            if (selectedPrize?.prizeName?.trim()) {
+              return [
+                {
+                  id: `prize-name-${selectedPrize.prizeId ?? "fallback"}`,
+                  quantity:
+                    typeof selectedPrize.quantity === "number" &&
+                    Number.isFinite(selectedPrize.quantity) &&
+                    selectedPrize.quantity > 0
+                      ? Math.round(selectedPrize.quantity)
+                      : 1,
+                  name: selectedPrize.prizeName.trim(),
+                },
+              ];
+            }
+
+            return [];
+          })();
+
+    const combinedItems = [...regularItems, ...rewardItems, ...prizeItems];
+    return combinedItems.length > 0
+      ? combinedItems
+      : [{ id: "fallback", quantity: 1, name: "Item do pedido" }];
+  }, [nextOrder]);
   const orderTotal = calculateOrderTotal(
     nextOrder
       ? {
           ...nextOrder,
+          progressiveDiscountAmount:
+            typeof nextOrder.progressiveDiscountSnapshot?.discountAmount === "number" &&
+            Number.isFinite(nextOrder.progressiveDiscountSnapshot.discountAmount)
+              ? nextOrder.progressiveDiscountSnapshot.discountAmount
+              : null,
           progressiveDiscountSteps: progressiveDiscount?.steps,
         }
       : null
@@ -725,14 +835,7 @@ export default function NextDeliveryScreen() {
             <View style={styles.itemsBlock}>
               <Text style={styles.itemsTitle}>Itens do Pedido</Text>
               <View style={styles.itemsList}>
-                {(orderItems.length > 0
-                  ? orderItems.map((item) => ({
-                    id: item.id,
-                    quantity: item.quantity,
-                    name: item.product?.name ?? "Item sem nome",
-                  }))
-                  : [{ id: "fallback", quantity: 1, name: "Item do pedido" }]
-                ).map((item) => (
+                {displayItems.map((item) => (
                   <View key={item.id} style={styles.itemRow}>
                     <View style={styles.quantityBadge}>
                       <Text style={styles.quantityText}>{item.quantity}x</Text>

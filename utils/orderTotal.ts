@@ -9,6 +9,7 @@ type TOrderTotalProduct = {
   amount?: number | null;
   fullAmount?: number | null;
   quantity?: number | null;
+  excludeFromProgressiveDiscount?: boolean | null;
 };
 
 type TOrderTotalDeliveryAddress = {
@@ -22,6 +23,7 @@ export type TOrderTotalInput = {
   deliveryAddress?: TOrderTotalDeliveryAddress | null;
   orderProducts?: TOrderTotalProduct[] | null;
   progressiveDiscountPercent?: number | null;
+  progressiveDiscountAmount?: number | null;
   progressiveDiscountSteps?: TProgressiveDiscountStep[] | null;
   salesTaxRate?: number | null;
 };
@@ -62,19 +64,34 @@ export function calculateOrderTotal(order: TOrderTotalInput | null | undefined) 
     const lineUnitAmount = fullAmountCents > 0 ? fullAmountCents : amountCents;
     return sum + lineUnitAmount * quantity;
   }, 0);
+  const progressiveDiscountEligibleSubtotal = orderProducts.reduce((sum, product) => {
+    if (product.excludeFromProgressiveDiscount) {
+      return sum;
+    }
+
+    const fullAmountCents = toValidCents(product.fullAmount);
+    const amountCents = toValidCents(product.amount);
+    const quantity = toValidQuantity(product.quantity);
+    const lineUnitAmount = fullAmountCents > 0 ? fullAmountCents : amountCents;
+    return sum + lineUnitAmount * quantity;
+  }, 0);
 
   const progressiveDiscountPercentFromSteps = getAppliedProgressiveDiscountPercent(
-    getReachedProgressiveSteps(order.progressiveDiscountSteps, subtotal),
+    getReachedProgressiveSteps(order.progressiveDiscountSteps, progressiveDiscountEligibleSubtotal),
   );
   const progressiveDiscountPercent =
     typeof order.progressiveDiscountPercent === "number" &&
     Number.isFinite(order.progressiveDiscountPercent)
       ? Math.max(0, order.progressiveDiscountPercent)
       : progressiveDiscountPercentFromSteps;
-  const progressiveDiscountAmount = calculateProgressiveDiscountAmount(
-    subtotal,
-    progressiveDiscountPercent,
-  );
+  const progressiveDiscountAmountFromInput = toValidCents(order.progressiveDiscountAmount ?? 0);
+  const progressiveDiscountAmount =
+    progressiveDiscountAmountFromInput > 0
+      ? Math.min(progressiveDiscountEligibleSubtotal, progressiveDiscountAmountFromInput)
+      : calculateProgressiveDiscountAmount(
+          progressiveDiscountEligibleSubtotal,
+          progressiveDiscountPercent,
+        );
   const discountedSubtotal = Math.max(0, subtotal - progressiveDiscountAmount);
 
   const taxRate =
