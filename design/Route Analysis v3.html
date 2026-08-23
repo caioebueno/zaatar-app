@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Zippy — Route Analysis</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800;900&family=Geist+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #050403; font-family: "Geist", sans-serif; -webkit-font-smoothing: antialiased; overflow: hidden; }
+    #root { height: 100%; }
+    button { font-family: inherit; cursor: pointer; border: none; background: none; }
+    ::-webkit-scrollbar { width: 3px; }
+    ::-webkit-scrollbar-thumb { background: rgba(250,245,238,0.08); border-radius: 3px; }
+
+    .ra-stage  { position: fixed; inset: 0; display: grid; place-items: center;
+                 background: radial-gradient(120% 80% at 50% 0%, #1a1410 0%, #050403 70%); }
+    .ra-canvas { width: 1366px; height: 1024px; display: flex; flex-direction: column;
+                 overflow: hidden; border-radius: 18px;
+                 box-shadow: 0 0 0 1px rgba(250,245,238,0.06), 0 0 0 8px #16120f,
+                             0 0 0 9px rgba(250,245,238,0.07), 0 40px 120px rgba(0,0,0,0.65);
+                 transform-origin: center center; }
+
+    .tab-btn { transition: background 140ms, color 140ms; }
+    .tab-btn:hover { opacity: 0.88; }
+    .date-pill { transition: all 120ms; }
+    .date-pill:hover { background: rgba(250,245,238,0.05) !important; }
+    .dispatch-row { transition: background 100ms, border-left-color 100ms; }
+    .dispatch-row:hover { background: rgba(250,245,238,0.03) !important; }
+  </style>
+
+  <script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="ra-data-v2.js"></script>
+<script src="tweaks-panel.jsx"     type="text/babel"></script>
+<script src="tablet-topbar.jsx"    type="text/babel"></script>
+<script src="ra-map-v2.jsx"        type="text/babel"></script>
+<script src="ra-analytics.jsx"     type="text/babel"></script>
+
+<script type="text/babel">
+
+
+const { useState, useEffect } = React;
+const D = RA_TOKENS;
+
+
+
+/* ── Dispatch row ─────────────────────────────────────────── */
+function DispatchRow({ dispatch, selected, onClick }) {
+  const { driver, id, stops = [], diversion, longStop, departureDelay, routeDuration, routeExpected } = dispatch;
+  const hasIssue = diversion.detected || longStop.detected || departureDelay > 5 || routeDuration > routeExpected + 4;
+  const selCol   = hasIssue ? (diversion.detected || longStop.detected ? D.zippy : D.amber) : D.green;
+
+  return (
+    <div onClick={onClick} className="dispatch-row" style={{
+      padding: "12px 16px 12px 14px",
+      borderBottom: `1px solid ${D.line}`,
+      borderLeft: `2px solid ${selected ? selCol : "transparent"}`,
+      background: selected ? `${selCol}09` : "transparent",
+      cursor: "pointer",
+      display: "flex", flexDirection: "column", gap: 9,
+    }}>
+
+      {/* ── Driver row ── */}
+      <div style={{ display: "flex", alignItems: "center", gap: 9 }}>
+        <div style={{
+          width: 30, height: 30, borderRadius: 9, flexShrink: 0,
+          background: driver.color, display: "grid", placeItems: "center",
+          fontSize: 10, fontWeight: 800, color: "#fff", letterSpacing: "0.02em",
+        }}>{driver.initials}</div>
+
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, color: D.text, letterSpacing: "-0.02em", lineHeight: 1.2 }}>
+            {driver.name}
+          </div>
+          <div style={{ fontFamily: D.mono, fontSize: 8, color: "#faf5ee40", letterSpacing: "0.08em", marginTop: 1 }}>
+            {id} · {stops.length} STOP{stops.length !== 1 ? "S" : ""}
+          </div>
+        </div>
+
+        {hasIssue && (
+          <div style={{
+            fontFamily: D.mono, fontSize: 7.5, fontWeight: 700,
+            color: selCol, background: `${selCol}14`,
+            border: `1px solid ${selCol}30`,
+            borderRadius: 4, padding: "2px 7px", flexShrink: 0,
+            letterSpacing: "0.08em",
+          }}>
+            {diversion.detected ? "DETOUR" : longStop.detected ? "STOP" : `+${departureDelay}m`}
+          </div>
+        )}
+      </div>
+
+      {/* ── Stop list ── */}
+      {stops.length > 0 && (
+        <div style={{
+          marginLeft: 39,
+          background: "rgba(250,245,238,0.025)",
+          border: `1px solid ${D.line}`,
+          borderRadius: 8,
+          overflow: "hidden",
+        }}>
+          {stops.map((s, i) => (
+            <div key={i} style={{
+              display: "flex", alignItems: "center", gap: 9,
+              padding: "7px 10px",
+              borderTop: i > 0 ? `1px solid ${D.line}` : "none",
+            }}>
+              <div style={{
+                width: 16, height: 16, borderRadius: 5, flexShrink: 0,
+                background: D.surf3,
+                border: "1px solid rgba(250,245,238,0.08)",
+                display: "grid", placeItems: "center",
+                fontFamily: D.mono, fontSize: 7.5, fontWeight: 700,
+                color: "#faf5ee60",
+              }}>{i + 1}</div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{
+                  fontSize: 11.5, fontWeight: 600, color: D.text,
+                  letterSpacing: "-0.01em", lineHeight: 1.2,
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                }}>{s.customer}</div>
+                <div style={{
+                  fontSize: 10, color: "#faf5ee80", marginTop: 1,
+                  whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis",
+                }}>{s.address}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Left dispatch list ───────────────────────────────────── */
+function DispatchList({ dispatches, selectedId, onSelect, date, onDateChange }) {
+  return (
+    <div style={{
+      width: 280, flexShrink: 0,
+      background: D.surf, borderRight: `1px solid ${D.line}`,
+      display: "flex", flexDirection: "column", overflow: "hidden"
+    }}>
+      {/* Header — date selector only */}
+      <div style={{ padding: "10px 12px", borderBottom: `1px solid ${D.line}`, flexShrink: 0 }} data-comment-anchor="004d3d5448-div-176-7">
+        <div style={{ display: "flex", gap: 3 }}>
+          {AVAILABLE_DATES.map((d) => {
+            const active = date === d.value;
+            return (
+              <button key={d.value} onClick={() => onDateChange(d.value)} className="date-pill" style={{
+                flex: 1, padding: "5px 0", textAlign: "center",
+                background: active ? "rgba(255,61,20,0.10)" : "transparent",
+                border: `1px solid ${active ? "rgba(255,61,20,0.28)" : D.line}`,
+                color: active ? D.zippy : D.faint,
+                fontFamily: D.mono, fontSize: 7.5, fontWeight: active ? 700 : 400,
+                borderRadius: 6, letterSpacing: "0.04em"
+              }}>
+                {d.label.split("·")[0].trim()}
+              </button>);
+
+          })}
+        </div>
+      </div>
+
+      {/* List */}
+      <div style={{ flex: 1, overflowY: "auto" }}>
+        {dispatches.length === 0 ?
+        <div style={{
+          display: "flex", alignItems: "center", justifyContent: "center",
+          height: "100%", fontFamily: D.mono, fontSize: 9, color: D.vfaint, letterSpacing: "0.10em"
+        }}>NO DELIVERIES</div> :
+        dispatches.map((d) =>
+        <DispatchRow key={d.id} dispatch={d}
+        selected={selectedId === d.id}
+        onClick={() => onSelect(d.id === selectedId ? null : d.id)} />
+
+        )}
+      </div>
+    </div>);
+
+}
+
+/* ── Scale hook ───────────────────────────────────────────── */
+function useScale(w, h, pad = 32) {
+  const [s, setS] = useState(() => Math.min((window.innerWidth - pad) / w, (window.innerHeight - pad) / h, 1));
+  useEffect(() => {
+    const upd = () => setS(Math.min((window.innerWidth - pad) / w, (window.innerHeight - pad) / h, 1));
+    window.addEventListener("resize", upd);
+    return () => window.removeEventListener("resize", upd);
+  }, [w, h, pad]);
+  return s;
+}
+
+/* ── App ──────────────────────────────────────────────────── */
+const RA3_DEFAULTS = { selectedDate: "14/05/2026", selectedDispatchId: "D-4831", tab: "routes" };
+
+function App() {
+  const [t, setTweak] = useTweaks(RA3_DEFAULTS);
+  const [date, setDate] = useState(t.selectedDate || "14/05/2026");
+  const [dispId, setDispId] = useState(t.selectedDispatchId || null);
+  const [tab, setTab] = useState(t.tab || "routes");
+  const scale = useScale(1366, 1024);
+
+  const dispatches = dispatchesByDate(date);
+  const dispatch = dispatches.find((d) => d.id === dispId) || null;
+
+  const handleDate = (d) => {
+    setDate(d);setDispId(null);
+    setTweak("selectedDate", d);
+    setTweak("selectedDispatchId", "");
+  };
+  const handleSelect = (id) => {
+    setDispId(id);
+    setTweak("selectedDispatchId", id || "");
+  };
+  const handleTab = (t) => {
+    setTab(t);
+    setTweak("tab", t);
+  };
+
+  const dateOpts = AVAILABLE_DATES.map((d) => ({ value: d.value, label: d.label }));
+  const dispOpts = dispatches.map((d) => ({ value: d.id, label: `${d.driver.name} → ${d.customer}` }));
+
+  return (
+    <React.Fragment>
+      <TweaksPanel title="Tweaks">
+        <TweakSection title="Date">
+          <TweakSelect label="Date" value={date} options={dateOpts} onChange={handleDate} />
+        </TweakSection>
+        <TweakSection title="Delivery">
+          <TweakSelect
+            label="Dispatch"
+            value={dispId || ""}
+            options={[{ value: "", label: "(none)" }, ...dispOpts]}
+            onChange={(v) => handleSelect(v || null)} />
+          
+        </TweakSection>
+        <TweakSection title="View">
+          <TweakRadio
+            label="Tab"
+            value={tab}
+            options={[{ value: "routes", label: "Routes" }, { value: "analytics", label: "Analytics" }]}
+            onChange={handleTab} />
+          
+        </TweakSection>
+      </TweaksPanel>
+
+      <div className="ra-stage">
+        <div className="ra-canvas" style={{ transform: `scale(${scale})` }}>
+
+          <TabletTopbar
+            mode="inner"
+            pageTitle="Route Analysis"
+            pageSubtitle="GPS DELIVERY REVIEW"
+            backLabel="Live Map"
+            onBack={() => { window.location.href = "Delivery Manager Map.html"; }}
+          />
+
+          <div style={{ flex: 1, display: "flex", overflow: "hidden" }}>
+
+            {/* Left: dispatch list — always visible */}
+            <DispatchList
+              dispatches={dispatches} selectedId={dispId}
+              onSelect={handleSelect} date={date} onDateChange={handleDate} />
+            
+
+            {/* Map — always visible */}
+            <div style={{ flex: 1, position: "relative", overflow: "hidden" }}>
+              <RAMapV2 dispatch={dispatch} allDispatches={dispatches} />
+              <RAMapLegendV2 />
+              {!dispatch && dispatches.length === 0 &&
+              <div style={{
+                position: "absolute", inset: 0,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                pointerEvents: "none"
+              }}>
+                  <div style={{
+                  background: "rgba(14,11,9,0.88)", border: `1px solid ${D.line}`,
+                  borderRadius: 14, padding: "24px 32px", textAlign: "center",
+                  backdropFilter: "blur(12px)"
+                }}>
+                    <div style={{ fontFamily: D.mono, fontSize: 8.5, letterSpacing: "0.18em", color: D.vfaint, marginBottom: 8 }}>NO DATA</div>
+                    <div style={{ fontSize: 12.5, color: D.faint }}>No deliveries for this date.</div>
+                  </div>
+                </div>
+              }
+            </div>
+            {/* Right panel — tab selector lives here */}
+            <RARightPanel dispatch={dispatch} tab={tab} onTabChange={handleTab} />
+
+          </div>
+        </div>
+      </div>
+    </React.Fragment>);
+
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

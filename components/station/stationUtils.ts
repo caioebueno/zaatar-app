@@ -1,5 +1,5 @@
 import { TOrder } from "@/types/order";
-import type { TPreparationStepCategory, TPreparationStepTrack, TSnooze } from "@/types/station";
+import type { TPreparationTaskStation, TPreparationStepTrack, TSnooze } from "@/types/station";
 
 export function isPreparationStepTrackCompleted(track: TPreparationStepTrack): boolean {
   const modifiers = track.preparationStepModifiers ?? [];
@@ -10,30 +10,20 @@ export function isPreparationStepTrackCompleted(track: TPreparationStepTrack): b
   return !!track.completed && modifiersCompleted && commentsCompleted;
 }
 
-export function isPreparationCategoryCompletedByTasks(
-  category: TPreparationStepCategory,
-): boolean {
-  if (category.steps.length === 0) return false;
-  return category.steps.every(isPreparationStepTrackCompleted);
-}
-
-export function isOrderCompleted(
-  order: TOrder,
-  _now: Date = new Date(),
-): boolean {
-  if (order.preparationStepCategory.length === 0) return false;
-  return order.preparationStepCategory.every(isPreparationCategoryCompletedByTasks);
+export function isOrderCompleted(order: TOrder): boolean {
+  if (order.preparationTaskStation.length === 0) return false;
+  return order.preparationTaskStation.every((s) => s.completed);
 }
 
 export function getActiveSnooze(
-  category: TPreparationStepCategory,
+  station: TPreparationTaskStation,
   now: Date = new Date(),
 ): {
   isSnoozed: boolean;
   snooze: TSnooze | null;
 } {
   const nowTime = now.getTime();
-  const valid = category.snoozes.filter((s) => !s.canceled);
+  const valid = station.snoozes.filter((s) => !s.canceled);
 
   const mapped = valid.map((snooze) => {
     const start = new Date(snooze.startedAt).getTime();
@@ -46,10 +36,7 @@ export function getActiveSnooze(
     .sort((a, b) => a.end - b.end)[0];
 
   if (active) {
-    return {
-      isSnoozed: true,
-      snooze: active.snooze,
-    };
+    return { isSnoozed: true, snooze: active.snooze };
   }
 
   const pastDue = mapped
@@ -57,16 +44,10 @@ export function getActiveSnooze(
     .sort((a, b) => b.end - a.end)[0];
 
   if (pastDue) {
-    return {
-      isSnoozed: false,
-      snooze: pastDue.snooze,
-    };
+    return { isSnoozed: false, snooze: pastDue.snooze };
   }
 
-  return {
-    isSnoozed: false,
-    snooze: null,
-  };
+  return { isSnoozed: false, snooze: null };
 }
 
 export function getOrderActiveSnooze(
@@ -78,11 +59,10 @@ export function getOrderActiveSnooze(
 } {
   const nowTime = now.getTime();
 
-  const activeSnoozes = order.preparationStepCategory
-    .flatMap((category) => category.snoozes || [])
+  const activeSnoozes = order.preparationTaskStation
+    .flatMap((station) => station.snoozes || [])
     .filter((snooze) => {
       if (snooze.canceled) return false;
-
       const start = new Date(snooze.startedAt).getTime();
       const end = start + snooze.duration * 1000;
       return end > nowTime;
@@ -94,20 +74,14 @@ export function getOrderActiveSnooze(
     });
 
   if (activeSnoozes.length === 0) {
-    return {
-      hasSnooze: false,
-      snooze: null,
-    };
+    return { hasSnooze: false, snooze: null };
   }
 
   const soonest = activeSnoozes.reduce((prev, curr) =>
     curr.end < prev.end ? curr : prev
   );
 
-  return {
-    hasSnooze: true,
-    snooze: soonest.snooze,
-  };
+  return { hasSnooze: true, snooze: soonest.snooze };
 }
 
 export function isOrderActivelySnoozed(
@@ -117,30 +91,24 @@ export function isOrderActivelySnoozed(
   return getOrderActiveSnooze(order, now).hasSnooze;
 }
 
-export function canViewOrder(
-  orders: TOrder[],
-  orderId: string,
-): boolean {
+export function canViewOrder(orders: TOrder[], orderId: string): boolean {
   const index = orders.findIndex((o) => o.id === orderId);
   if (index === -1) return false;
   if (isOrderCompleted(orders[index])) return true;
 
-  const isCategoryResolved = (category: TPreparationStepCategory) => {
-    if (isPreparationCategoryCompletedByTasks(category)) return true;
-
-    const hasSnooze = category.snoozes?.some((s) => !s.canceled);
+  const isStationResolved = (station: TPreparationTaskStation) => {
+    if (station.completed) return true;
+    const hasSnooze = station.snoozes?.some((s) => !s.canceled);
     return !!hasSnooze;
   };
 
   const isOrderResolved = (order: TOrder) => {
-    if (order.preparationStepCategory.length === 0) return false;
-    return order.preparationStepCategory.every(isCategoryResolved);
+    if (order.preparationTaskStation.length === 0) return false;
+    return order.preparationTaskStation.every(isStationResolved);
   };
 
   for (let i = 0; i < index; i++) {
-    if (!isOrderResolved(orders[i])) {
-      return false;
-    }
+    if (!isOrderResolved(orders[i])) return false;
   }
 
   return true;
@@ -170,13 +138,8 @@ export function cancelActiveSnooze(
     const start = new Date(snooze.startedAt).getTime();
     const end = start + snooze.duration * 1000;
     const isActive = !snooze.canceled && end > nowTime;
-
     if (!isActive) return snooze;
-
-    return {
-      ...snooze,
-      canceled: true,
-    };
+    return { ...snooze, canceled: true };
   });
 }
 
@@ -189,49 +152,33 @@ export function addSnooze(
 
   const hasActiveSnooze = snoozes.some((snooze) => {
     if (snooze.canceled) return false;
-
     const startedAt = new Date(snooze.startedAt).getTime();
     const endsAt = startedAt + snooze.duration * 1000;
     return endsAt > nowTime;
   });
 
-  if (hasActiveSnooze) {
-    return snoozes;
-  }
+  if (hasActiveSnooze) return snoozes;
 
   return [
     ...snoozes,
-    {
-      startedAt: now.toISOString(),
-      duration,
-      canceled: false,
-    },
+    { startedAt: now.toISOString(), duration, canceled: false },
   ];
 }
 
-export function updateOrdersPreparationCategory(
+export function updateOrdersPreparationTaskStation(
   orders: TOrder[],
-  categoryId: string,
-  updates: Partial<TPreparationStepCategory>,
+  stationGroupId: string,
+  updates: Partial<TPreparationTaskStation>,
 ): TOrder[] {
-  return orders.map((order) => {
-    const updatedCategories = order.preparationStepCategory.map((category) => {
-      if (category.id !== categoryId) return category;
-
-      const updatedCategory: TPreparationStepCategory = {
-        ...category,
-        ...updates,
-        steps: updates.steps ?? category.steps,
-      };
-
+  return orders.map((order) => ({
+    ...order,
+    preparationTaskStation: order.preparationTaskStation.map((station) => {
+      if (station.id !== stationGroupId) return station;
       return {
-        ...updatedCategory,
+        ...station,
+        ...updates,
+        steps: updates.steps ?? station.steps,
       };
-    });
-
-    return {
-      ...order,
-      preparationStepCategory: updatedCategories,
-    };
-  });
+    }),
+  }));
 }

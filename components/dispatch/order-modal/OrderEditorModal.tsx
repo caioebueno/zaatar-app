@@ -176,6 +176,7 @@ type TCartComboSelection = {
 
 export type TOrderEditorInitialOrder = {
   id?: string;
+  sourcePlatform?: "FOODY" | "DOORDASH" | "UBER_EATS" | "SQUARE" | null;
   type?: TOrderType;
   paymentMethod?: "CASH" | "CARD" | "ZELLE";
   tip?: number | null;
@@ -247,9 +248,20 @@ export type TOrderEditorInitialOrder = {
   }[];
 };
 
+// External marketplace sources (imported via Square). FOODY = internal, editable.
+const ORDER_SOURCE_CFG: Record<
+  "DOORDASH" | "UBER_EATS" | "SQUARE",
+  { label: string; fg: string; bg: string }
+> = {
+  DOORDASH: { label: "DoorDash", fg: "#E01500", bg: "rgba(224,21,0,0.10)" },
+  UBER_EATS: { label: "Uber Eats", fg: "#0B8A3C", bg: "rgba(6,193,103,0.12)" },
+  SQUARE: { label: "Square", fg: "#1466C4", bg: "rgba(0,106,255,0.10)" },
+};
+
 type OrderEditorModalProps = {
   visible: boolean;
   apiBaseUrl: string;
+  authToken: string;
   mode: "create" | "update";
   title?: string;
   submitLabel?: string;
@@ -1136,6 +1148,7 @@ function getRenderableModifierGroups(product: TCategoryApiProduct | null): TModi
 export default function OrderEditorModal({
   visible,
   apiBaseUrl,
+  authToken,
   mode,
   title,
   submitLabel,
@@ -1213,7 +1226,9 @@ export default function OrderEditorModal({
         setLoading(true);
         setError(null);
 
-        const response = await fetch(`${apiBaseUrl}/categories`);
+        const response = await fetch(`${apiBaseUrl}/categories`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
         if (!response.ok) {
           throw new Error("Falha ao carregar categorias");
         }
@@ -1256,7 +1271,9 @@ export default function OrderEditorModal({
         setPromotionsLoading(true);
         setPromotionsError(null);
 
-        const response = await fetch(`${apiBaseUrl}/pos/exclusive-promotions`);
+        const response = await fetch(`${apiBaseUrl}/pos/exclusive-promotions`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
         if (!response.ok) {
           throw new Error("Falha ao carregar promoções");
         }
@@ -1613,6 +1630,7 @@ export default function OrderEditorModal({
 
           const response = await fetch(
             `${apiBaseUrl}/customers/search?phone=${encodeURIComponent(query)}`,
+            { headers: { Authorization: `Bearer ${authToken}` } },
           );
 
           const responseBody = (await response.json().catch(() => null)) as
@@ -1688,6 +1706,7 @@ export default function OrderEditorModal({
 
           const response = await fetch(
             `${apiBaseUrl}/address-search?q=${encodeURIComponent(query)}`,
+            { headers: { Authorization: `Bearer ${authToken}` } },
           );
 
           const responseBody = (await response.json().catch(() => null)) as
@@ -1749,7 +1768,9 @@ export default function OrderEditorModal({
 
     const loadProgressiveDiscount = async () => {
       try {
-        const response = await fetch(`${apiBaseUrl}/progressive-discount`);
+        const response = await fetch(`${apiBaseUrl}/progressive-discount`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
         if (!response.ok) {
           throw new Error("Falha ao carregar desconto progressivo");
         }
@@ -2397,7 +2418,27 @@ export default function OrderEditorModal({
     setCreateOrderLoading(false);
   };
 
-  const resolvedTitle = title ?? (mode === "update" ? "Atualizar Pedido" : "Criar Pedido");
+  // External marketplace orders (DoorDash / Uber Eats / Square) are read-only:
+  // only the Info tab is shown and the order cannot be edited.
+  const externalSource =
+    initialOrder?.sourcePlatform && initialOrder.sourcePlatform !== "FOODY"
+      ? initialOrder.sourcePlatform
+      : null;
+  const isReadOnly = mode === "update" && externalSource !== null;
+  const readonlySourceCfg = externalSource ? ORDER_SOURCE_CFG[externalSource] : null;
+  const readonlyCustomerName = initialOrder?.customer?.name?.trim() || "Guest";
+  const readonlyCustomerPhone = initialOrder?.customer?.phone?.trim() || null;
+  const readonlyItems = (initialOrder?.orderProducts ?? []).map((orderProduct, index) => ({
+    key: orderProduct.id ?? `${orderProduct.productId}-${index}`,
+    quantity:
+      typeof orderProduct.quantity === "number" && orderProduct.quantity > 0
+        ? orderProduct.quantity
+        : 1,
+    name: orderProduct.product?.name?.trim() || "Item",
+  }));
+
+  const resolvedTitle =
+    title ?? (isReadOnly ? "Detalhes do Pedido" : mode === "update" ? "Atualizar Pedido" : "Criar Pedido");
   const resolvedSubmitLabel = submitLabel ?? (mode === "update" ? "Update Order" : "Make Order");
   const resolvedSubmittingLabel =
     mode === "update" ? "Updating..." : "Creating...";
@@ -2477,6 +2518,7 @@ export default function OrderEditorModal({
             method: "POST",
             headers: {
               "Content-Type": "application/json",
+              Authorization: `Bearer ${authToken}`,
             },
             body: JSON.stringify(requestBody),
           });
@@ -2559,6 +2601,7 @@ export default function OrderEditorModal({
           method: "PATCH",
           headers: {
             "Content-Type": "application/json",
+            Authorization: `Bearer ${authToken}`,
           },
           body: JSON.stringify(requestBody),
         });
@@ -2617,6 +2660,7 @@ export default function OrderEditorModal({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
+          Authorization: `Bearer ${authToken}`,
         },
         body: JSON.stringify({
           phone,
@@ -2694,6 +2738,71 @@ export default function OrderEditorModal({
         </View>
 
         <View style={styles.body}>
+          {isReadOnly ? (
+            <ScrollView
+              style={styles.readonlyScroll}
+              contentContainerStyle={styles.readonlyContent}
+              showsVerticalScrollIndicator={false}
+            >
+              {/* Only the Info tab is available for external orders */}
+              <View style={styles.readonlyTabBar}>
+                <View style={[styles.readonlyTab, styles.readonlyTabActive]}>
+                  <Feather name="info" size={14} color="#2d2d2d" />
+                  <Text style={styles.readonlyTabText}>Info</Text>
+                </View>
+              </View>
+
+              {/* Source + customer */}
+              <View style={styles.readonlyCard}>
+                <View style={styles.readonlyCardHeader}>
+                  <Text style={styles.readonlyCardTitle}>Cliente</Text>
+                  {readonlySourceCfg && (
+                    <View
+                      style={[
+                        styles.readonlySourceBadge,
+                        { backgroundColor: readonlySourceCfg.bg },
+                      ]}
+                    >
+                      <Feather name="external-link" size={11} color={readonlySourceCfg.fg} />
+                      <Text style={[styles.readonlySourceText, { color: readonlySourceCfg.fg }]}>
+                        {readonlySourceCfg.label}
+                      </Text>
+                    </View>
+                  )}
+                </View>
+                <Text style={styles.readonlyCustomerName}>{readonlyCustomerName}</Text>
+                <Text
+                  style={readonlyCustomerPhone ? styles.readonlyCustomerPhone : styles.readonlyMuted}
+                >
+                  {readonlyCustomerPhone ?? "Sem telefone"}
+                </Text>
+              </View>
+
+              {/* Items */}
+              <View style={styles.readonlyCard}>
+                <Text style={styles.readonlyCardTitle}>Itens</Text>
+                {readonlyItems.length === 0 ? (
+                  <Text style={styles.readonlyMuted}>Nenhum item.</Text>
+                ) : (
+                  readonlyItems.map((item) => (
+                    <View key={item.key} style={styles.readonlyItemRow}>
+                      <Text style={styles.readonlyItemQty}>{item.quantity}×</Text>
+                      <Text style={styles.readonlyItemName}>{item.name}</Text>
+                    </View>
+                  ))
+                )}
+              </View>
+
+              {/* Lock note */}
+              <View style={styles.readonlyLockNote}>
+                <Feather name="lock" size={12} color="#9a9a9a" />
+                <Text style={styles.readonlyLockText}>
+                  Pedido de origem externa — somente leitura.
+                </Text>
+              </View>
+            </ScrollView>
+          ) : (
+          <>
           <View style={styles.productsSection}>
             <View style={styles.categoryTabsContainer}>
               {promotionsLoading ? (
@@ -3125,6 +3234,8 @@ export default function OrderEditorModal({
               <Feather name="send" size={14} color="#ffffff" />
             </Pressable>
           </View>
+          </>
+          )}
         </View>
 
         <Modal
@@ -3721,6 +3832,126 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#ffffff",
     overflow: "hidden",
+  },
+  readonlyScroll: {
+    flex: 1,
+    backgroundColor: "#f6f6f4",
+  },
+  readonlyContent: {
+    padding: 16,
+    gap: 12,
+    maxWidth: 720,
+    width: "100%",
+    alignSelf: "center",
+  },
+  readonlyTabBar: {
+    flexDirection: "row",
+    gap: 8,
+  },
+  readonlyTab: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 9,
+    borderWidth: 1,
+    borderColor: "#e2e0db",
+    backgroundColor: "#ffffff",
+  },
+  readonlyTabActive: {
+    borderColor: "#2d2d2d",
+  },
+  readonlyTabText: {
+    fontFamily: "Geist_600SemiBold",
+    fontSize: 13.5,
+    fontWeight: "600",
+    color: "#2d2d2d",
+  },
+  readonlyCard: {
+    backgroundColor: "#ffffff",
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "#ececE7",
+    padding: 14,
+    gap: 6,
+  },
+  readonlyCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  readonlyCardTitle: {
+    fontFamily: "Geist_600SemiBold",
+    fontSize: 12,
+    fontWeight: "600",
+    color: "#9a9a9a",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  readonlySourceBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    borderRadius: 6,
+    paddingVertical: 3,
+    paddingHorizontal: 7,
+  },
+  readonlySourceText: {
+    fontFamily: "Geist_700Bold",
+    fontSize: 10.5,
+    lineHeight: 12,
+    fontWeight: "700",
+    letterSpacing: 0.2,
+  },
+  readonlyCustomerName: {
+    fontFamily: "Geist_600SemiBold",
+    fontSize: 17,
+    fontWeight: "600",
+    color: "#2d2d2d",
+    marginTop: 2,
+  },
+  readonlyCustomerPhone: {
+    fontFamily: "Geist_400Regular",
+    fontSize: 13.5,
+    color: "#555555",
+  },
+  readonlyMuted: {
+    fontFamily: "Geist_400Regular",
+    fontSize: 13.5,
+    color: "#9a9a9a",
+  },
+  readonlyItemRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: 8,
+    paddingVertical: 4,
+  },
+  readonlyItemQty: {
+    fontFamily: "Geist_600SemiBold",
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#2d2d2d",
+    minWidth: 28,
+  },
+  readonlyItemName: {
+    flex: 1,
+    fontFamily: "Geist_400Regular",
+    fontSize: 14,
+    color: "#2d2d2d",
+  },
+  readonlyLockNote: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    paddingHorizontal: 4,
+    paddingTop: 2,
+  },
+  readonlyLockText: {
+    fontFamily: "Geist_400Regular",
+    fontSize: 12.5,
+    color: "#9a9a9a",
   },
   categoryTabsContainer: {
     zIndex: 2,

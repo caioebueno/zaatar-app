@@ -21,6 +21,9 @@ export type TPreparationStepTrack = {
   name: string;
   quantity: number;
   completed: boolean;
+  completedAt?: string;
+  goalMinutes?: number;
+  expectedAt?: string;
   comments?: string;
   completedComments?: boolean;
   preparationStepModifiers?: TTPreparationStepModifierTrack[];
@@ -42,6 +45,16 @@ export type TPreparationStepCategory = {
   completed: boolean;
   orderId: string;
   snoozes: TSnooze[];
+  steps: TPreparationStepTrack[];
+};
+
+export type TPreparationTaskStation = {
+  id: string;
+  stationId?: string;
+  completed: boolean;
+  orderId: string;
+  snoozes: TSnooze[];
+  station: { id: string; name: string };
   steps: TPreparationStepTrack[];
 };
 
