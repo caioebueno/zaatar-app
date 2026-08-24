@@ -1,16 +1,20 @@
-import BackToSitemapButton from "@/components/BackToSitemapButton";
-import CreateOrderModal from "@/components/dispatch/CreateOrderModal";
+import POSScreen from "@/app/(app)/pos";
+import { TabletTopBar } from "@/components/TabletTopBar";
 import UpdateOrderModal from "@/components/dispatch/UpdateOrderModal";
 import type { TOrderEditorInitialOrder } from "@/components/dispatch/order-modal/OrderEditorModal";
 import { API_BASE_URL } from "@/constants/api";
+import { useAuth } from "@/contexts/auth";
 import type { TPreparationStepCategory } from "@/types/station";
 import Feather from "@expo/vector-icons/Feather";
+import { router } from "expo-router";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Alert,
   Animated,
   Dimensions,
   Linking,
+  Modal,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -21,11 +25,14 @@ import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 //@ts-expect-error
 import DispatchRouteMap from "../components/dispatch/DispatchRouteMap";
 
+type TOrderSourcePlatform = "FOODY" | "DOORDASH" | "UBER_EATS" | "SQUARE";
+
 type TDispatchOrder = {
   id: string;
   createdAt: string;
   scheduleFor?: string | null;
   number?: string;
+  sourcePlatform?: TOrderSourcePlatform | null;
   tip?: number | null;
   tipAmount?: number | null;
   estimatedDeliveryDurationMinutes: number | number;
@@ -84,6 +91,7 @@ type TDispatchOrder = {
     lat?: string;
     lng?: string;
     deliveryFee?: number;
+    expectedHandoffDuration?: number; // seconds, default 300
   } | null;
   orderProducts: {
     id: string;
@@ -133,6 +141,8 @@ type TDispatch = {
   queueIndex?: number | null;
   dispatched: boolean;
   dispatchAt?: string | null;
+  dispatchedAt?: string | null;
+  completedAt?: string | null;
   estimatedDeliveryDurationMinutes?: number | null;
   estimatedRoundTripDurationMinutes?: number | null;
   driverId?: string | null;
@@ -142,13 +152,14 @@ type TDispatch = {
 
 type TDispatchTab = "ACTIVE" | "COMPLETED";
 
-const FALLBACK_CUSTOMER = "Maria Santos";
+const FALLBACK_CUSTOMER = "Guest";
 const ROUTE_POINT_ADDRESS_FALLBACK = "Endereço indisponível";
-const ROUTE_ORIGIN = {
+const ROUTE_ORIGIN: TRoutePoint = {
   lat: 28.34871749755003,
   lng: -81.65145586075074,
   label: "Origem",
   address: "Zaatar",
+  complement: null,
   mapQuery: "28.34871749755003,-81.65145586075074",
 };
 const MAP_MODAL_SLIDE_DISTANCE = Dimensions.get("window").width;
@@ -159,6 +170,7 @@ type TRoutePoint = {
   lng: number;
   label: string;
   address: string;
+  complement: string | null;
   mapQuery: string;
 };
 type TRouteCoordinate = {
@@ -236,6 +248,7 @@ function getDispatchRoutePoints(dispatch: TDispatch): TRoutePoint[] {
         lng,
         label: `${customerName} #${orderIdentifier}`,
         address,
+        complement: formatDeliveryInstruction(order),
         mapQuery,
       };
     })
@@ -260,9 +273,14 @@ function toDirectRouteCoordinates(points: TRoutePoint[]): TRouteCoordinate[] {
   }));
 }
 
+type TRouteResult = {
+  coordinates: TRouteCoordinate[];
+  legDurationsSeconds: number[];
+};
+
 async function fetchDrivingRouteCoordinates(
   points: TRoutePoint[],
-): Promise<TRouteCoordinate[] | null> {
+): Promise<TRouteResult | null> {
   if (points.length < 2) return null;
 
   const encodedPoints = points
@@ -277,19 +295,21 @@ async function fetchDrivingRouteCoordinates(
 
   const data = (await response.json()) as {
     routes?: {
-      geometry?: {
-        coordinates?: [number, number][];
-      };
+      geometry?: { coordinates?: [number, number][] };
+      legs?: { duration?: number }[];
     }[];
   };
 
-  const coordinates = data.routes?.[0]?.geometry?.coordinates;
+  const route = data.routes?.[0];
+  const coordinates = route?.geometry?.coordinates;
   if (!coordinates || coordinates.length === 0) return null;
 
-  return coordinates.map(([lng, lat]) => ({
-    latitude: lat,
-    longitude: lng,
-  }));
+  const legDurationsSeconds = (route?.legs ?? []).map((leg) => leg.duration ?? 0);
+
+  return {
+    coordinates: coordinates.map(([lng, lat]) => ({ latitude: lat, longitude: lng })),
+    legDurationsSeconds,
+  };
 }
 
 function getRouteRegion(points: TRoutePoint[]): TRouteRegion {
@@ -321,8 +341,10 @@ function getRouteRegion(points: TRoutePoint[]): TRouteRegion {
   };
 }
 
-export async function fetchDispatches() {
-  const response = await fetch(`${API_BASE_URL}/dispatches`);
+export async function fetchDispatches(token: string) {
+  const response = await fetch(`${API_BASE_URL}/dispatches`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 
   if (!response.ok) {
     throw new Error("Falha ao buscar entregas");
@@ -331,8 +353,10 @@ export async function fetchDispatches() {
   return response.json() as Promise<TDispatch[]>;
 }
 
-export async function fetchDrivers() {
-  const response = await fetch(`${API_BASE_URL}/drivers`);
+export async function fetchDrivers(token: string) {
+  const response = await fetch(`${API_BASE_URL}/drivers`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
 
   if (!response.ok) {
     throw new Error("Falha ao buscar motoristas");
@@ -347,6 +371,7 @@ type TUpdateDriverPayload = {
 };
 
 export async function updateDriver(
+  token: string,
   driverId: string,
   payload: TUpdateDriverPayload,
 ) {
@@ -358,6 +383,7 @@ export async function updateDriver(
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(payload),
   });
@@ -411,6 +437,7 @@ type TMoveDispatchOrderResponse = {
 };
 
 export async function updateDispatchStatus(
+  token: string,
   dispatchId: string,
   payload: TUpdateDispatchStatusPayload,
 ) {
@@ -418,6 +445,7 @@ export async function updateDispatchStatus(
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(payload),
   });
@@ -439,6 +467,7 @@ export async function updateDispatchStatus(
 export async function moveDispatchOrder(
   orderId: string,
   payload: TMoveDispatchOrderPayload,
+  token: string,
 ): Promise<TMoveDispatchOrderResponse> {
   const normalizedPayload: TMoveDispatchOrderPayload = {};
 
@@ -464,6 +493,7 @@ export async function moveDispatchOrder(
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(normalizedPayload),
   });
@@ -488,11 +518,12 @@ export async function moveDispatchOrder(
   return responseBody as TMoveDispatchOrderResponse;
 }
 
-export async function updateOrder(orderId: string, payload: TUpdateOrderPayload) {
+export async function updateOrder(orderId: string, payload: TUpdateOrderPayload, token: string) {
   const response = await fetch(`${API_BASE_URL}/orders/${orderId}`, {
     method: "PATCH",
     headers: {
       "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
     },
     body: JSON.stringify(payload),
   });
@@ -513,13 +544,30 @@ export async function updateOrder(orderId: string, payload: TUpdateOrderPayload)
   return responseBody;
 }
 
+async function finalizeDispatch(dispatchId: string, token: string) {
+  const response = await fetch(`${API_BASE_URL}/dispatches/${dispatchId}`, {
+    method: "PATCH",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ completedAt: new Date().toISOString() }),
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: string } | null;
+    throw new Error(body?.error || "Falha ao finalizar despacho");
+  }
+}
+
 type TWatchDispatchesOptions = {
+  token: string;
   intervalMs?: number;
   onDispatches?: (dispatches: TDispatch[]) => void;
   onError?: (error: unknown) => void;
 };
 
 export function watchDispatches({
+  token,
   intervalMs = DISPATCH_POLL_INTERVAL_MS,
   onDispatches,
   onError,
@@ -533,7 +581,7 @@ export function watchDispatches({
 
     try {
       isFetching = true;
-      const nextDispatches = await fetchDispatches();
+      const nextDispatches = await fetchDispatches(token);
       if (stopped) return;
 
       onDispatches?.(nextDispatches);
@@ -573,6 +621,8 @@ type DispatchOrderCardProps = {
   isDimmed?: boolean;
   onOrderPress: () => void;
   onActionPress: () => void;
+  onMarkDelivered?: () => void;
+  isMarkingDelivered?: boolean;
 };
 
 type TOrderDerivedStatus = "ACCEPTED" | "PREPARING" | "DELIVERING" | "DELIVERED";
@@ -620,6 +670,80 @@ function getEstimatedDeliveryDurationMs(order: TDispatchOrder) {
   return order.estimatedDeliveryDurationMinutes * ONE_MINUTE_MS;
 }
 
+function useDispatchTimer(dispatchAt: string | null | undefined) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, []);
+  const dispatchMs = dispatchAt ? new Date(dispatchAt).getTime() : null;
+  const elapsedMs = dispatchMs ? Math.max(0, now - dispatchMs) : 0;
+  const remainingMs = dispatchMs ? 0 : 0; // overridden by caller
+  return { now, dispatchMs, elapsedMs };
+}
+
+function mmss(ms: number) {
+  const total = Math.floor(Math.abs(ms) / 1000);
+  const m = Math.floor(total / 60);
+  const s = total % 60;
+  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+}
+
+function AddressPulseDot() {
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 1400, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 0, useNativeDriver: true }),
+        Animated.delay(1000),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [pulse]);
+  const scale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 2.4] });
+  const opacity = pulse.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.4, 0, 0] });
+  return (
+    <View style={{ width: 6, height: 6, alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+      <Animated.View style={{
+        position: "absolute", width: 6, height: 6, borderRadius: 999,
+        backgroundColor: "rgba(250,245,238,0.3)", transform: [{ scale }], opacity,
+      }} />
+      <View style={styles.orderAddressDot} />
+    </View>
+  );
+}
+
+function PulsingDot({ color }: { color: string }) {
+  const pulse = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 1200, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 0, useNativeDriver: true }),
+        Animated.delay(600),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [pulse]);
+
+  const scale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 2.8] });
+  const opacity = pulse.interpolate({ inputRange: [0, 0.6, 1], outputRange: [0.6, 0, 0] });
+
+  return (
+    <View style={{ width: 6, height: 6, alignItems: "center", justifyContent: "center" }}>
+      <Animated.View style={{
+        position: "absolute", width: 6, height: 6, borderRadius: 3,
+        backgroundColor: color, transform: [{ scale }], opacity,
+      }} />
+      <View style={{ width: 5, height: 5, borderRadius: 3, backgroundColor: color }} />
+    </View>
+  );
+}
+
 function formatDepartureDeltaValue(deltaMs: number) {
   const absoluteMs = Math.abs(deltaMs);
   const totalMinutes = Math.ceil(absoluteMs / ONE_MINUTE_MS);
@@ -630,6 +754,60 @@ function formatDepartureDeltaValue(deltaMs: number) {
   }
 
   return `${totalMinutes} min`;
+}
+
+function formatDepartureDeltaMMSS(deltaMs: number) {
+  const absoluteMs = Math.abs(deltaMs);
+  const totalSeconds = Math.floor(absoluteMs / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`;
+}
+
+function OrderDepartureTime({ order }: { order: TDispatchOrder }) {
+  const [deltaToLeaveMs, setDeltaToLeaveMs] = useState(0);
+
+  useEffect(() => {
+    const update = () => {
+      const referenceDeliveryAt = getReferenceDeliveryAt(order);
+      if (!referenceDeliveryAt) { setDeltaToLeaveMs(0); return; }
+      setDeltaToLeaveMs(referenceDeliveryAt - getEstimatedDeliveryDurationMs(order) - Date.now());
+    };
+    update();
+    const timerId = setInterval(update, 1000);
+    return () => clearInterval(timerId);
+  }, [order]);
+
+  const isLate = deltaToLeaveMs < 0;
+  const dotColor = isLate ? "#ff3d14" : "#f2b338";
+  const pulse = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, { toValue: 1, duration: 1000, useNativeDriver: true }),
+        Animated.timing(pulse, { toValue: 0, duration: 0, useNativeDriver: true }),
+        Animated.delay(800),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, [pulse]);
+  const scale = pulse.interpolate({ inputRange: [0, 1], outputRange: [1, 2.6] });
+  const opacity = pulse.interpolate({ inputRange: [0, 0.5, 1], outputRange: [0.5, 0, 0] });
+  return (
+    <View style={styles.orderTimerPill}>
+      <View style={{ width: 6, height: 6, alignItems: "center", justifyContent: "center" }}>
+        <Animated.View style={{
+          position: "absolute", width: 6, height: 6, borderRadius: 999,
+          backgroundColor: dotColor, transform: [{ scale }], opacity,
+        }} />
+        <View style={[styles.orderTimerDot, { backgroundColor: dotColor }]} />
+      </View>
+      <Text style={[styles.orderTimerText, isLate && styles.orderTimerTextLate]}>
+        {formatDepartureDeltaMMSS(deltaToLeaveMs)}
+      </Text>
+    </View>
+  );
 }
 
 function OrderDepartureBadge({ order }: { order: TDispatchOrder }) {
@@ -673,6 +851,95 @@ function formatMinutes(minutes?: number | null) {
     return "-";
   }
   return `${Math.round(minutes)} min`;
+}
+
+type TUrgencyTone = "neutral" | "warn" | "late" | "live" | "done";
+
+function useOrderUrgency(order: TDispatchOrder, dispatchDispatched: boolean): { tone: TUrgencyTone; label: string } {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (order.delivered) return;
+    const id = setInterval(() => setNow(Date.now()), 5000);
+    return () => clearInterval(id);
+  }, [order.delivered]);
+  if (order.delivered) return { tone: "done", label: "Entregue" };
+  const referenceDeliveryAt = getReferenceDeliveryAt(order);
+  if (!referenceDeliveryAt) return { tone: "neutral", label: "Sem previsão" };
+  if (dispatchDispatched) {
+    const deltaMs = referenceDeliveryAt - now;
+    const tone: TUrgencyTone = deltaMs < 0 ? "late" : "live";
+    const absMin = Math.max(1, Math.ceil(Math.abs(deltaMs) / ONE_MINUTE_MS));
+    return { tone, label: deltaMs < 0 ? `Atrasado ${absMin} min` : `${absMin} min para entregar` };
+  }
+  const leaveByAt = referenceDeliveryAt - getEstimatedDeliveryDurationMs(order);
+  const deltaMs = leaveByAt - now;
+  const tone: TUrgencyTone = deltaMs < 0 ? "late" : deltaMs < 10 * ONE_MINUTE_MS ? "warn" : "neutral";
+  const absMin = Math.max(1, Math.ceil(Math.abs(deltaMs) / ONE_MINUTE_MS));
+  return { tone, label: deltaMs < 0 ? `Atrasado ${absMin} min` : `${absMin} min para sair` };
+}
+
+const URGENCY_TONE_STYLE: Record<TUrgencyTone, { bg: string; fg: string; icon: string }> = {
+  neutral: { bg: "rgba(108,98,89,0.18)", fg: "#A89B90", icon: "clock" },
+  warn:    { bg: "rgba(255,61,20,0.14)",  fg: "#FF7A5C", icon: "clock" },
+  late:    { bg: "rgba(255,61,20,0.15)",  fg: "#FF3D14", icon: "alert-circle" },
+  live:    { bg: "rgba(0,168,102,0.18)",  fg: "#34D98A", icon: "navigation" },
+  done:    { bg: "rgba(0,168,102,0.15)",  fg: "#34D98A", icon: "check-circle" },
+};
+
+function OrderUrgencyChip({ tone, label }: { tone: TUrgencyTone; label: string }) {
+  const s = URGENCY_TONE_STYLE[tone];
+  return (
+    <View style={[styles.urgencyChip, { backgroundColor: s.bg }]}>
+      <Feather name={s.icon as any} size={12} color={s.fg} />
+      <Text style={[styles.urgencyChipText, { color: s.fg }]}>{label}</Text>
+    </View>
+  );
+}
+
+
+const ORDER_SOURCE_CFG: Partial<Record<TOrderSourcePlatform, { label: string; fg: string; bg: string }>> = {
+  DOORDASH:  { label: "DoorDash",  fg: "#FF6A4D", bg: "rgba(235,23,0,0.14)" },
+  UBER_EATS: { label: "Uber Eats", fg: "#4FD87A", bg: "rgba(6,193,103,0.14)" },
+  SQUARE:    { label: "Square",    fg: "#5AA9FF", bg: "rgba(0,106,255,0.14)" },
+};
+
+// External marketplace orders (imported via Square) show a source badge.
+// Internal Foody orders (and missing/unknown sources) render no badge.
+function OrderSourceBadge({ source }: { source?: TOrderSourcePlatform | null }) {
+  if (!source) return null;
+  const cfg = ORDER_SOURCE_CFG[source];
+  if (!cfg) return null;
+  return (
+    <View style={[styles.sourceBadge, { backgroundColor: cfg.bg }]}>
+      <Feather name="external-link" size={10} color={cfg.fg} />
+      <Text style={[styles.sourceBadgeText, { color: cfg.fg }]}>{cfg.label}</Text>
+    </View>
+  );
+}
+
+const DISPATCH_STATUS_CFG = {
+  pending: { bg: "rgba(108,98,89,0.15)", bar: "#6C6259", fg: "#A89B90", icon: "clock" as const },
+  enroute: { bg: "rgba(255,61,20,0.14)", bar: "#FF3D14", fg: "#FF7A5C", icon: "navigation" as const },
+  done:    { bg: "rgba(0,168,102,0.15)", bar: "#00A866", fg: "#34D98A", icon: "check-circle" as const },
+};
+
+function DispatchStatusStrip({ state, returnLabel }: {
+  state: "pending" | "enroute" | "done";
+  returnLabel?: string | null;
+}) {
+  const s = DISPATCH_STATUS_CFG[state];
+  const stateLabel = { pending: "Não despachada", enroute: "Em rota", done: "Concluída" }[state];
+  return (
+    <View style={[styles.statusStrip, { backgroundColor: s.bg, borderLeftColor: s.bar }]}>
+      <Feather name={s.icon} size={17} color={s.fg} />
+      <View style={{ flex: 1 }}>
+        <Text style={[styles.statusStripTitle, { color: s.fg }]}>{stateLabel}</Text>
+      </View>
+      {returnLabel != null && (
+        <Text style={[styles.statusStripReturn, { color: s.fg }]}>{returnLabel}</Text>
+      )}
+    </View>
+  );
 }
 
 function getDispatchQueueIndex(dispatch: TDispatch) {
@@ -722,6 +989,7 @@ function getSortedDispatches(dispatches: TDispatch[]) {
 function toOrderEditorInitialOrder(order: TDispatchOrder): TOrderEditorInitialOrder {
   return {
     id: order.id,
+    sourcePlatform: order.sourcePlatform,
     type: order.type,
     paymentMethod: order.paymentMethod,
     tip: typeof order.tip === "number" && Number.isFinite(order.tip) ? order.tip : null,
@@ -800,6 +1068,8 @@ function DispatchOrderCard({
   isDimmed,
   onOrderPress,
   onActionPress,
+  onMarkDelivered,
+  isMarkingDelivered,
 }: DispatchOrderCardProps) {
   type TDispatchOrderItemLine = {
     key: string;
@@ -807,12 +1077,12 @@ function DispatchOrderCard({
     isPrize?: boolean;
     isReward?: boolean;
   };
-  const customerName = order.customer?.name ?? FALLBACK_CUSTOMER;
+  const customerName = (order.customer?.name ?? FALLBACK_CUSTOMER).split(" ")[0];
   const customerPhone = order.customer?.phone?.trim() || null;
   const deliveryInstruction = formatDeliveryInstruction(order);
   const orderStatus = getDerivedOrderStatus(order, dispatchDispatched);
   const isTakeaway = order.type === "TAKEAWAY";
-  const [isExpanded, setIsExpanded] = useState(false);
+  const [isExpanded] = useState(false);
   const handleOpenCustomerWhatsApp = async () => {
     if (!customerPhone) {
       Alert.alert("Telefone indisponível", "Este cliente não possui telefone para contato.");
@@ -910,171 +1180,101 @@ function DispatchOrderCard({
 
   const orderItems = [...regularOrderItems, ...rewardOrderItems, ...prizeOrderItems];
   const hasOrderItems = orderItems.length > 0;
-  const hasExpandableContent = hasOrderItems || showActionButton;
+
+  const { tone: urgencyTone, label: urgencyLabel } = useOrderUrgency(order, dispatchDispatched);
+  const urgencyRailColor = { neutral: "#6C6259", warn: "#FF7A5C", late: "#FF3D14", live: "#FF7A5C", done: "#00A866" }[urgencyTone];
 
   return (
-    <View style={[styles.orderCard, isDimmed && styles.orderCardDimmed]}>
-      <Pressable style={styles.orderCardTop} onPress={onOrderPress}>
-        {/* {isTakeaway && (
-          <View style={styles.orderBadgesRow}>
-            <View style={[styles.orderTypeBadge, styles.orderTypeBadgeTakeaway]}>
-              <Text style={[styles.orderTypeBadgeText, styles.orderTypeBadgeTextTakeaway]}>
-                Retirada
-              </Text>
+    <View style={[styles.orderCard2, isDimmed && styles.orderCardDimmed]}>
+      <View style={[styles.orderCard2Rail, { backgroundColor: urgencyRailColor }]} />
+      <View style={{ flex: 1 }}>
+        <Pressable style={styles.orderCard2Body} onPress={onOrderPress}>
+          {/* ID + name + urgency chip */}
+          <View style={{ flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8, flexWrap: "wrap" }}>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: 8, flexShrink: 1 }}>
+              <Text style={styles.orderCard2Id}>#{order.number ?? "—"}</Text>
+              <Text style={styles.orderCard2Name} numberOfLines={1}>{customerName}</Text>
+              <OrderSourceBadge source={order.sourcePlatform} />
             </View>
+            <OrderUrgencyChip tone={urgencyTone} label={urgencyLabel} />
           </View>
-        )} */}
-        <View style={styles.orderHeaderRow}>
-          <View style={styles.orderHeaderCustomerBlock}>
-            <Text style={styles.orderCustomerName}>{customerName} #{order.number ?? "1235"}</Text>
-            {customerPhone ? (
-              <View style={styles.orderCustomerContactRow}>
-                <Text style={styles.orderCustomerPhone}>Tel: {customerPhone}</Text>
-                <Pressable
-                  style={styles.orderWhatsAppButton}
-                  onPress={(event) => {
-                    event.stopPropagation?.();
-                    void handleOpenCustomerWhatsApp();
-                  }}
-                >
-                  <Feather name="message-circle" size={14} color="#1d7a43" />
-                  <Text style={styles.orderWhatsAppButtonText}>WhatsApp</Text>
-                </Pressable>
+
+          {/* Address + complement */}
+          {!isTakeaway && order.deliveryAddress && (
+            <View style={{ gap: 3, marginTop: 4 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                <Feather name="map-pin" size={12} color="#9C8E83" />
+                <Text style={styles.orderCard2Address}>
+                  {[order.deliveryAddress.street, order.deliveryAddress.city].filter(Boolean).join(", ")}
+                </Text>
               </View>
-            ) : null}
-          </View>
-          {/* <Text style={styles.orderSmallText}>Pedido </Text> */}
-          {orderStatus === "DELIVERED" ? (
-            <View style={styles.deliveredBadge}>
-              <Text style={styles.deliveredBadgeText}>Delivered</Text>
-            </View>
-          ) : (
-            <OrderDepartureBadge order={order} />
-          )}
-        </View>
-        {!isTakeaway && (
-          <View>
-            <View
-              style={{
-                flexDirection: 'row'
-              }}
-            >
-              <View style={[{
-                paddingVertical:8,
-                paddingHorizontal: 12,
-                borderColor: '#DEDEDE',
-                borderRadius: 12,
-                flex: 1,
-                borderWidth: 1
-              }, order.estimatedDeliveryDurationMinutes ? {
-                borderTopRightRadius: 0,
-                borderBottomRightRadius: 0,
-              } : {}]}>
-                <Text
-                  style={{
-                    fontSize: 15,
-                    fontWeight: '500'
-                  }}
-                >{order.deliveryAddress?.street}, {order.deliveryAddress?.city}</Text>
-              </View>
-              {order.estimatedDeliveryDurationMinutes && (
-                <View
-                  style={{
-                    paddingVertical: 8,
-                    paddingHorizontal: 12,
-                    borderTopLeftRadius: 0,
-                    borderBottomLeftRadius: 0,
-                    borderColor: '#DEDEDE',
-                    borderRadius: 12,
-                    borderWidth: 1,
-                    borderLeftWidth: 0
-                  }}
-                >
-                  <Text
-                    style={{
-                      fontSize: 15,
-                      fontWeight: '500'
-                    }}
-                  >
-                    {order.estimatedDeliveryDurationMinutes} min
+              {(order.deliveryAddress.complement || order.deliveryAddress.numberComplement) && (
+                <View style={{ paddingLeft: 18, flexDirection: "row", gap: 5, alignItems: "baseline" }}>
+                  <Text style={styles.orderCard2ComplLabel}>Compl:</Text>
+                  <Text style={styles.orderCard2Compl}>
+                    {[order.deliveryAddress.complement, order.deliveryAddress.numberComplement].filter(Boolean).join(" ")}
                   </Text>
                 </View>
               )}
             </View>
-            {!isTakeaway && deliveryInstruction && (
-              <View style={styles.noteContainer}>
-                <View style={styles.noteInner}>
-                  <Feather name="file-text" size={16} color="#e67e22" />
-                  <Text style={styles.noteText}>{deliveryInstruction}</Text>
-                </View>
+          )}
+
+          {/* Note (fallback for deliveryInstruction not already in complement) */}
+          {deliveryInstruction && !order.deliveryAddress?.complement && !order.deliveryAddress?.numberComplement && (
+            <View style={styles.noteContainer}>
+              <View style={styles.noteInner}>
+                <Feather name="file-text" size={12} color="#f2b338" />
+                <Text style={styles.noteText}>{deliveryInstruction}</Text>
               </View>
+            </View>
+          )}
+
+          {/* Items */}
+          {hasOrderItems && (
+            <View style={{ flexDirection: "column", gap: 1, marginTop: 4 }}>
+              {orderItems.map((item) => (
+                <Text key={item.key} style={styles.orderCard2Item}>
+                  {item.label.replace(/^(\d+)x {2}/, (_, n: string) => `${n}× `)}
+                </Text>
+              ))}
+            </View>
+          )}
+        </Pressable>
+
+        {/* Footer actions */}
+        {!isTakeaway && (showActionButton || (dispatchDispatched && !order.delivered)) && (
+          <View style={styles.orderCard2Footer}>
+            {dispatchDispatched && !order.delivered && onMarkDelivered && (
+              <Pressable
+                style={[styles.orderCard2BtnSuccess, isMarkingDelivered && styles.orderMoveButtonDisabled]}
+                disabled={isMarkingDelivered}
+                onPress={onMarkDelivered}
+              >
+                <Feather name="check" size={14} color="#34D98A" />
+                <Text style={styles.orderCard2BtnSuccessText}>
+                  {isMarkingDelivered ? "Marcando..." : "Marcar como entregue"}
+                </Text>
+              </Pressable>
+            )}
+            {showActionButton && (
+              <Pressable
+                style={[styles.orderCard2BtnGhost, actionLabel === "Cancelar" && styles.orderMoveButtonCancel, actionDisabled && styles.orderMoveButtonDisabled]}
+                disabled={actionDisabled}
+                onPress={onActionPress}
+              >
+                <Feather
+                  name={actionLabel === "Cancelar" ? "x" : "repeat"}
+                  size={13}
+                  color={actionLabel === "Cancelar" ? "#ff3d14" : "#C8BCB0"}
+                />
+                <Text style={[styles.orderCard2BtnGhostText, actionLabel === "Cancelar" && styles.orderMoveButtonTextCancel]}>
+                  {actionLabel}
+                </Text>
+              </Pressable>
             )}
           </View>
         )}
-
-      </Pressable>
-
-      {isExpanded && (
-        <View style={styles.orderItemsContainer}>
-          {orderItems.map((item) => (
-            <View key={item.key} style={styles.orderItemBlock}>
-              <View style={styles.orderItemRow}>
-                <View style={styles.orderItemContent}>
-                  <Text style={styles.orderItemText}>{item.label}</Text>
-                </View>
-                {item.isPrize && (
-                  <View style={styles.prizeBadge}>
-                    <Text style={styles.prizeBadgeText}>Prize</Text>
-                  </View>
-                )}
-                {item.isReward && (
-                  <View style={styles.rewardBadge}>
-                    <Text style={styles.rewardBadgeText}>Reward</Text>
-                  </View>
-                )}
-              </View>
-            </View>
-          ))}
-        </View>
-      )}
-
-      {hasExpandableContent && (
-        <View
-          style={[
-            styles.showMoreSection,
-            isExpanded && styles.showMoreSectionWithDivider,
-          ]}
-        >
-          {isExpanded ? (
-            <View style={styles.orderFooterButtonsRow}>
-              <Pressable
-                style={[styles.showMoreButton, styles.orderFooterButton]}
-                onPress={() => setIsExpanded(false)}
-              >
-                <Text style={styles.showMoreButtonText}>Hide</Text>
-              </Pressable>
-
-              {showActionButton && (
-                <Pressable
-                  style={[
-                    styles.orderActionButton,
-                    styles.orderFooterButton,
-                    actionDisabled && styles.orderActionButtonDisabled,
-                  ]}
-                  disabled={actionDisabled}
-                  onPress={onActionPress}
-                >
-                  <Text style={styles.orderActionButtonText}>{actionLabel}</Text>
-                </Pressable>
-              )}
-            </View>
-          ) : (
-            <Pressable style={styles.showMoreButton} onPress={() => setIsExpanded(true)}>
-              <Text style={styles.showMoreButtonText}>Show more</Text>
-            </Pressable>
-          )}
-        </View>
-      )}
+      </View>
     </View>
   );
 }
@@ -1083,6 +1283,7 @@ type DispatchColumnProps = {
   dispatch: TDispatch;
   targetQueueIndex: number | null;
   drivers: TDriver[];
+  driversOnDelivery: Set<string>;
   isDispatching: boolean;
   isAssigningDriver: boolean;
   isQueueUpdating: boolean;
@@ -1104,6 +1305,14 @@ type DispatchColumnProps = {
   isTakeawayOrderDispatchingById: (orderId: string) => boolean;
   onOpenOrder: (order: TDispatchOrder) => void;
   onOpenMap: (dispatch: TDispatch) => void;
+  isFirstInQueue: boolean;
+  isLastInQueue: boolean;
+  onMoveQueueLeft: () => void;
+  onMoveQueueRight: () => void;
+  onMarkOrderDelivered: (orderId: string) => void;
+  markingOrderDeliveredById: Record<string, boolean>;
+  onFinalize: (dispatchId: string) => void;
+  isFinalizing: boolean;
 };
 
 type TDispatchTypeBadge = {
@@ -1111,8 +1320,19 @@ type TDispatchTypeBadge = {
   label: "Entrega" | "Retirada";
 };
 
+function hasTimestampValue(value?: string | null) {
+  return typeof value === "string" ? value.trim().length > 0 : false;
+}
+
 function isDispatchCompleted(dispatch: TDispatch) {
-  return dispatch.orders.length > 0 && dispatch.orders.every((order) => order.delivered);
+  return hasTimestampValue(dispatch.completedAt);
+}
+
+function canFinalizeDispatch(dispatch: TDispatch): boolean {
+  if (!dispatch.dispatched || isDispatchCompleted(dispatch)) return false;
+  const isTakeaway = dispatch.orders.every((o) => o.type === "TAKEAWAY");
+  if (isTakeaway) return true;
+  return dispatch.orders.every((o) => o.delivered);
 }
 
 function getDispatchTypeBadges(dispatch: TDispatch): TDispatchTypeBadge[] {
@@ -1131,10 +1351,120 @@ function getDispatchTypeBadges(dispatch: TDispatch): TDispatchTypeBadge[] {
   return badges;
 }
 
+type TDriverStatus = "rastreando" | "entrega" | "semsinal";
+
+function DriverSelectorModal({
+  drivers,
+  driversOnDelivery,
+  currentDriverId,
+  onSelect,
+  onClose,
+}: {
+  drivers: TDriver[];
+  driversOnDelivery: Set<string>;
+  currentDriverId: string | null | undefined;
+  onSelect: (driverId: string | null) => void;
+  onClose: () => void;
+}) {
+  const getStatus = (d: TDriver): TDriverStatus =>
+    driversOnDelivery.has(d.id) ? "entrega" : d.active ? "rastreando" : "semsinal";
+
+  const rank: Record<TDriverStatus, number> = { rastreando: 0, entrega: 1, semsinal: 2 };
+  const sorted = [...drivers].sort((a, b) => rank[getStatus(a)] - rank[getStatus(b)]);
+
+  const statusCfg: Record<TDriverStatus, { label: string; dot: string; fg: string; bg: string }> = {
+    rastreando: { label: "Rastreando", dot: "#34D98A", fg: "#34D98A", bg: "rgba(0,168,102,0.12)" },
+    entrega:    { label: "Em entrega", dot: "#FF7A5C", fg: "#FF7A5C", bg: "rgba(255,61,20,0.12)" },
+    semsinal:   { label: "Sem sinal",  dot: "#6C6259", fg: "#9C8E83", bg: "rgba(239,231,218,0.06)" },
+  };
+
+  const hasCurrent = !!currentDriverId;
+
+  return (
+    <Modal visible animationType="fade" transparent onRequestClose={onClose}>
+      <Pressable style={styles.driverSelectorBackdrop} onPress={onClose}>
+        <Pressable style={styles.driverSelectorPanel} onPress={(e) => e.stopPropagation()}>
+          {/* Header */}
+          <View style={styles.driverSelectorHeader}>
+            <View style={styles.driverSelectorIconWrap}>
+              <Feather name={hasCurrent ? "repeat" : "user-plus"} size={19} color="#FF3D14" />
+            </View>
+            <View style={{ flex: 1, minWidth: 0 }}>
+              <Text style={styles.driverSelectorTitle}>
+                {hasCurrent ? "Trocar motorista" : "Atribuir motorista"}
+              </Text>
+              <Text style={styles.driverSelectorSub} numberOfLines={1}>
+                {hasCurrent
+                  ? `Atual: ${drivers.find((d) => d.id === currentDriverId)?.name ?? ""}`
+                  : "Escolha um motorista"}
+              </Text>
+            </View>
+            <Pressable style={styles.driverSelectorCloseBtn} onPress={onClose}>
+              <Feather name="x" size={17} color="rgba(250,245,238,0.7)" />
+            </Pressable>
+          </View>
+
+          {/* List */}
+          <ScrollView
+            style={styles.driverSelectorList}
+            contentContainerStyle={{ paddingVertical: 8, paddingHorizontal: 14 }}
+            showsVerticalScrollIndicator={false}
+          >
+            {sorted.map((driver) => {
+              const status = getStatus(driver);
+              const cfg = statusCfg[status];
+              const isCurrent = driver.id === currentDriverId;
+              const initials = driver.name.split(" ").filter(Boolean).map((w: string) => w[0].toUpperCase()).slice(0, 2).join("");
+
+              return (
+                <Pressable
+                  key={driver.id}
+                  onPress={() => { onSelect(driver.id); onClose(); }}
+                  style={[
+                    styles.driverSelectorRow,
+                    isCurrent && styles.driverSelectorRowCurrent,
+                  ]}
+                >
+                  <View style={[styles.driverSelectorAvatar, status === "semsinal" && styles.driverSelectorAvatarDisabled]}>
+                    <Text style={styles.driverSelectorAvatarText}>{initials}</Text>
+                  </View>
+                  <View style={{ flex: 1, minWidth: 0 }}>
+                    <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
+                      <Text style={[styles.driverSelectorName, status === "semsinal" && { color: "#9C8E83" }]} numberOfLines={1}>
+                        {driver.name}
+                      </Text>
+                      {isCurrent && (
+                        <View style={styles.driverSelectorCurrentBadge}>
+                          <Text style={styles.driverSelectorCurrentBadgeText}>Atual</Text>
+                        </View>
+                      )}
+                    </View>
+                    <Text style={styles.driverSelectorPriority}>P{driver.priorityLevel}</Text>
+                  </View>
+                  <View style={[styles.driverSelectorStatusBadge, { backgroundColor: cfg.bg }]}>
+                    <View style={[styles.driverSelectorStatusDot, { backgroundColor: cfg.dot }]} />
+                    <Text style={[styles.driverSelectorStatusText, { color: cfg.fg }]}>{cfg.label}</Text>
+                  </View>
+                  <View style={styles.driverSelectorRowIcon}>
+                    {isCurrent
+                      ? <Feather name="check" size={18} color="#FF3D14" />
+                      : <Feather name="chevron-right" size={17} color="rgba(250,245,238,0.3)" />}
+                  </View>
+                </Pressable>
+              );
+            })}
+          </ScrollView>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
 function DispatchColumn({
   dispatch,
   targetQueueIndex,
   drivers,
+  driversOnDelivery,
   isDispatching,
   isAssigningDriver,
   isQueueUpdating,
@@ -1156,35 +1486,46 @@ function DispatchColumn({
   isTakeawayOrderDispatchingById,
   onOpenOrder,
   onOpenMap,
+  isFirstInQueue,
+  isLastInQueue,
+  onMoveQueueLeft,
+  onMoveQueueRight,
+  onMarkOrderDelivered,
+  markingOrderDeliveredById,
+  onFinalize,
+  isFinalizing,
 }: DispatchColumnProps) {
   const driverName = dispatch.driver?.name?.trim();
   const hasDriver = !!driverName;
+  const driverInitials = driverName ? driverName.split(" ").filter(Boolean).map((w) => w[0].toUpperCase()).slice(0, 2).join("") : null;
   const sortedOrders = getSortedDispatchOrders(dispatch.orders);
-  const orderCount = sortedOrders.length;
   const dispatchTypeBadges = getDispatchTypeBadges(dispatch);
   const isDispatchButtonDisabled = dispatch.dispatched || isDispatching;
   const isMoveMode = !!movingOrderId;
   const isTakeaway = dispatch.orders[0]?.type === 'TAKEAWAY'
+  const { elapsedMs } = useDispatchTimer(
+    dispatch.dispatched ? (dispatch.dispatchedAt ?? dispatch.dispatchAt) : null
+  );
+  const totalHandoffMinutes = sortedOrders.reduce(
+    (sum, o) => sum + (o.deliveryAddress?.expectedHandoffDuration ?? 300) / 60, 0
+  );
+  const roundTripMs = ((dispatch.estimatedRoundTripDurationMinutes ?? 0) + totalHandoffMinutes) * 60 * 1000;
+  const remainingMs = Math.max(0, roundTripMs - elapsedMs);
   const [isDriverPickerOpen, setIsDriverPickerOpen] = useState(false);
   const sortedDrivers = useMemo(() => getSortedDrivers(drivers), [drivers]);
-  const selectableDrivers = useMemo(() => {
-    const activeDrivers = sortedDrivers.filter((driver) => driver.active);
-    const currentAssignedDriver = sortedDrivers.find(
-      (driver) => driver.id === dispatch.driverId
-    );
-
-    if (!currentAssignedDriver) return activeDrivers;
-    if (currentAssignedDriver.active) return activeDrivers;
-
-    return [currentAssignedDriver, ...activeDrivers];
-  }, [dispatch.driverId, sortedDrivers]);
+  const selectableDrivers = useMemo(() => sortedDrivers, [sortedDrivers]);
 
   useEffect(() => {
     if (!isTakeaway) return;
     setIsDriverPickerOpen(false);
   }, [isTakeaway]);
 
+  const isCompleted = isDispatchCompleted(dispatch);
+  const dispatchState: "pending" | "enroute" | "done" =
+    isCompleted ? "done" : dispatch.dispatched ? "enroute" : "pending";
   const renderInsertSlot = (targetIndex: number) => {
+    if (isTakeaway) return <></>;
+
     const isSamePosition =
       movingSourceDispatchId === dispatch.id &&
       movingSourceOrderIndex === targetIndex;
@@ -1206,195 +1547,191 @@ function DispatchColumn({
         onPress={() => onMoveToIndex(dispatch.id, targetIndex)}
         disabled={isMoveBusy}
       >
-        <Feather name="plus" size={22} color="#666666" />
+        {isMoveBusy
+          ? <ActivityIndicator size="small" color="#ff3d14" />
+          : <Feather name="plus" size={19} color="#ff3d14" />
+        }
       </Pressable>
     );
   };
 
   return (
-    <ScrollView style={styles.dispatchColumn} contentContainerStyle={styles.dispatchColumn}>
+   <ScrollView contentContainerStyle={{ paddingVertical: 16 }}>
+     <View  style={styles.dispatchColumn}>
       <View style={styles.dispatchSummaryCard}>
-        <View style={styles.dispatchTypeBadgesRow}>
-          {dispatchTypeBadges.map((badge) => (
-            // <View
-            //   key={`${dispatch.id}-${badge.key}`}
-            //   style={[
-            //     styles.dispatchTypeBadge,
-            //     badge.key === "delivery"
-            //       ? styles.dispatchTypeBadgeDelivery
-            //       : styles.dispatchTypeBadgeTakeaway,
-            //   ]}
-            // >
-            <Text
-              key={`${dispatch.id}-${badge.key}`}
-              style={[
-                styles.dispatchTypeBadgeText,
-              ]}
+        {/* Card header */}
+        <View style={styles.dispatchCardHeader2}>
+          <View style={[styles.dispatchTypeIconWrap, isTakeaway ? styles.dispatchTypeIconWrapTakeaway : styles.dispatchTypeIconWrapDelivery]}>
+            <Feather name={isTakeaway ? "shopping-bag" : "truck"} size={19} color={isTakeaway ? "#f2b338" : "#ff3d14"} />
+          </View>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.dispatchCardHeader2Title}>{isTakeaway ? "Retirada" : "Entrega"}</Text>
+          </View>
+          <View style={{ flexDirection: "row", gap: 6 }}>
+            <Pressable
+              style={[styles.dispatchNavButton, (isQueueUpdating || isFirstInQueue) && styles.dispatchNavButtonDisabled]}
+              disabled={isQueueUpdating || isFirstInQueue}
+              onPress={onMoveQueueLeft}
             >
-              {badge.label}
-            </Text>
-            // </View>
-          ))}
+              <Feather name="chevron-left" size={14} color="rgba(250,245,238,0.6)" />
+            </Pressable>
+            <Pressable
+              style={[styles.dispatchNavButton, (isQueueUpdating || isLastInQueue) && styles.dispatchNavButtonDisabled]}
+              disabled={isQueueUpdating || isLastInQueue}
+              onPress={onMoveQueueRight}
+            >
+              <Feather name="chevron-right" size={14} color="rgba(250,245,238,0.6)" />
+            </Pressable>
+          </View>
         </View>
-        <View style={styles.dispatchSummaryInner}>
-          <View style={styles.queueIndexRow}>
-            <Text style={styles.queueIndexLabel}>
-              Fila #{getDispatchQueueIndex(dispatch) ?? "-"}
-            </Text>
-            {isQueueMoveMode ? (
-              isQueueSelected ? (
+
+        {/* Dispatch level — delivery */}
+        {!isTakeaway && (
+          <View style={styles.dispatchLevel}>
+            <DispatchStatusStrip
+              state={dispatchState}
+              returnLabel={dispatchState === "enroute" ? `${mmss(remainingMs)} p/ voltar` : null}
+            />
+
+            {/* Driver row */}
+            <Pressable
+              style={[styles.driverRow2, isAssigningDriver && { opacity: 0.6 }]}
+              disabled={isAssigningDriver}
+              onPress={() => setIsDriverPickerOpen((p) => !p)}
+            >
+              <View style={[styles.driverRow2Avatar, hasDriver && styles.driverRow2AvatarFilled]}>
+                {driverInitials ? (
+                  <Text style={styles.driverRow2AvatarText}>{driverInitials}</Text>
+                ) : (
+                  <Feather name="user" size={16} color="rgba(239,231,218,0.3)" />
+                )}
+              </View>
+              <View style={{ flex: 1 }}>
+                <Text style={[styles.driverRow2Name, !hasDriver && styles.driverRow2NameEmpty]}>
+                  {hasDriver ? driverName : "Sem motorista"}
+                </Text>
+              </View>
+              <View style={[styles.driverRow2ActionBtn, hasDriver ? styles.driverRow2ActionBtnSecondary : styles.driverRow2ActionBtnPrimary]}>
+                <Feather name={hasDriver ? "repeat" : "user-plus"} size={13} color={hasDriver ? "#C8BCB0" : "#FF3D14"} />
+                <Text style={[styles.driverRow2ActionText, hasDriver && styles.driverRow2ActionTextSecondary]}>
+                  {hasDriver ? "Trocar" : "Atribuir"}
+                </Text>
+              </View>
+            </Pressable>
+
+            {/* Driver selector modal */}
+            {isDriverPickerOpen && (
+              <DriverSelectorModal
+                drivers={sortedDrivers}
+                driversOnDelivery={driversOnDelivery}
+                currentDriverId={dispatch.driverId}
+                onSelect={(driverId) => { onAssignDriver(dispatch.id, driverId); }}
+                onClose={() => setIsDriverPickerOpen(false)}
+              />
+            )}
+
+            {/* ETA boxes */}
+            <View style={{ flexDirection: "row", gap: 10 }}>
+              <View style={styles.etaBox}>
+                <Text style={styles.etaBoxLabel}>{dispatchState === "enroute" ? "EM ROTA A" : "ENTREGA"}</Text>
+                <Text style={[styles.etaBoxValue, dispatchState === "enroute" && { color: "#FF7A5C" }]}>
+                  {dispatchState === "enroute"
+                    ? (sortedOrders.find((o) => !o.delivered)?.number
+                        ? `#${sortedOrders.find((o) => !o.delivered)!.number}`
+                        : "Em rota")
+                    : dispatchState === "done" ? "—"
+                    : formatMinutes((dispatch.estimatedDeliveryDurationMinutes ?? 0) + totalHandoffMinutes)}
+                </Text>
+              </View>
+              <View style={styles.etaBox}>
+                <Text style={styles.etaBoxLabel}>
+                  {dispatchState === "enroute" ? "VOLTA EM" : dispatchState === "done" ? "EM ROTA POR" : "IDA E VOLTA"}
+                </Text>
+                <Text style={[styles.etaBoxValue, dispatchState === "done" && { color: "#34D98A" }]}>
+                  {dispatchState === "enroute" ? mmss(remainingMs) : formatMinutes((dispatch.estimatedRoundTripDurationMinutes ?? 0) + totalHandoffMinutes)}
+                </Text>
+              </View>
+            </View>
+
+            {/* Actions */}
+            {dispatchState === "pending" ? (
+              <View style={{ flexDirection: "row", gap: 8 }}>
                 <Pressable
-                  style={[styles.queueActionButton, styles.queueActionButtonCancel]}
-                  disabled={isQueueUpdating}
-                  onPress={onCancelMoveDispatchQueue}
+                  style={[styles.dispatchBtn2Primary, (!hasDriver || isDispatching || dispatch.dispatched) && styles.dispatchBtn2PrimaryDisabled]}
+                  onPress={() => onDispatch(dispatch.id)}
+                  disabled={!hasDriver || isDispatching || dispatch.dispatched}
                 >
-                  <Text style={styles.queueActionButtonText}>Cancelar</Text>
+                  <Feather name="send" size={15} color={(!hasDriver || isDispatching) ? "rgba(250,245,238,0.45)" : "#ffffff"} />
+                  <Text style={[styles.dispatchBtn2PrimaryText, (!hasDriver || isDispatching) && styles.dispatchBtn2PrimaryTextDisabled]}>
+                    {isDispatching ? "Despachando..." : "Despachar"}
+                  </Text>
                 </Pressable>
-              ) : (
-                <Pressable
-                  style={[
-                    styles.queueActionButton,
-                    (isQueueUpdating || targetQueueIndex === null) &&
-                      styles.queueActionButtonDisabled,
-                  ]}
-                  disabled={isQueueUpdating || targetQueueIndex === null}
-                  onPress={() => {
-                    if (targetQueueIndex === null) return;
-                    onMoveDispatchQueueToPosition(targetQueueIndex);
-                  }}
-                >
-                  <Text style={styles.queueActionButtonText}>Mover aqui</Text>
+                <Pressable style={styles.dispatchBtn2Secondary} onPress={() => onOpenMap(dispatch)}>
+                  <Feather name="compass" size={16} color="#FF3D14" />
+                  <Text style={styles.dispatchBtn2SecondaryText}>Ver rota</Text>
                 </Pressable>
-              )
+              </View>
             ) : (
-              <Pressable
-                style={[styles.queueActionButton, isQueueUpdating && styles.queueActionButtonDisabled]}
-                disabled={isQueueUpdating}
-                onPress={() => onStartMoveDispatchQueue(dispatch.id)}
-              >
-                <Text style={styles.queueActionButtonText}>Alterar ordem</Text>
-              </Pressable>
+              <View style={{ flexDirection: "row", gap: 8 }}>
+                <Pressable style={[styles.dispatchBtn2Route, { flex: 1 }]} onPress={() => onOpenMap(dispatch)}>
+                  <Feather name="compass" size={16} color="#FF3D14" />
+                  <Text style={styles.dispatchBtn2RouteText}>Ver rota</Text>
+                </Pressable>
+                {canFinalizeDispatch(dispatch) && (
+                  <Pressable
+                    style={[styles.dispatchBtn2Primary, isFinalizing && styles.dispatchBtn2PrimaryDisabled]}
+                    onPress={() => onFinalize(dispatch.id)}
+                    disabled={isFinalizing}
+                  >
+                    <Feather name="check-circle" size={15} color={isFinalizing ? "rgba(250,245,238,0.45)" : "#ffffff"} />
+                    <Text style={[styles.dispatchBtn2PrimaryText, isFinalizing && styles.dispatchBtn2PrimaryTextDisabled]}>
+                      {isFinalizing ? "Finalizando..." : "Finalizar"}
+                    </Text>
+                  </Pressable>
+                )}
+              </View>
             )}
           </View>
+        )}
 
-          {!isTakeaway && (
-            <View style={styles.dispatchHeaderBlock}>
-              <View style={styles.dispatchHeaderRow}>
-                <View style={styles.dispatchDriverPickerBlock}>
+        {/* Takeaway dispatch level */}
+        {isTakeaway && (
+          <View style={[styles.dispatchLevel, { paddingTop: 10 }]}>
+            {dispatch.dispatched ? (
+              <View style={{ gap: 8 }}>
+                <View style={[styles.statusStrip, { backgroundColor: "rgba(0,168,102,0.15)", borderLeftColor: "#00A866" }]}>
+                  <Feather name="check-circle" size={17} color="#34D98A" />
+                  <View style={{ flex: 1 }}>
+                    <Text style={[styles.statusStripTitle, { color: "#34D98A" }]}>Despachada</Text>
+                  </View>
+                </View>
+                {canFinalizeDispatch(dispatch) && (
                   <Pressable
-                    style={[
-                      styles.dispatchDriverPickerButton,
-                      isAssigningDriver && styles.dispatchDriverPickerButtonDisabled,
-                    ]}
-                    disabled={isAssigningDriver}
-                    onPress={() => setIsDriverPickerOpen((previous) => !previous)}
+                    style={[styles.dispatchBtn2Primary, isFinalizing && styles.dispatchBtn2PrimaryDisabled]}
+                    onPress={() => onFinalize(dispatch.id)}
+                    disabled={isFinalizing}
                   >
-                    <Text style={styles.driverName}>
-                      {hasDriver ? driverName : "Sem motorista"}
+                    <Feather name="check-circle" size={15} color={isFinalizing ? "rgba(250,245,238,0.45)" : "#ffffff"} />
+                    <Text style={[styles.dispatchBtn2PrimaryText, isFinalizing && styles.dispatchBtn2PrimaryTextDisabled]}>
+                      {isFinalizing ? "Finalizando..." : "Finalizar"}
                     </Text>
-                    <Feather
-                      name={isDriverPickerOpen ? "chevron-up" : "chevron-down"}
-                      size={16}
-                      color="#666666"
-                    />
                   </Pressable>
-                  <View style={styles.driverCountBadge}>
-                    <Text style={styles.driverMeta}>{orderCount}</Text>
-                  </View>
-                </View>
-
-                <View style={styles.dispatchDurationInfoContainer}>
-                  <View style={[styles.dispatchDurationInfoRow, {
-                    borderBottomRightRadius: 0,
-                    borderBottomLeftRadius: 0,
-                    borderBottomWidth: 0,
-                    // borderBottomRightRadius: 0,
-                    // borderRightWidth: 0,
-                  }]}>
-                    <Text style={styles.dispatchDurationInfoLabel}>Entrega</Text>
-                    <Text style={styles.dispatchDurationInfoValue}>
-                      {formatMinutes(dispatch.estimatedDeliveryDurationMinutes)}
-                    </Text>
-                  </View>
-                  <View style={[styles.dispatchDurationInfoRow, {
-                    borderTopLeftRadius: 0,
-                    borderTopRightRadius: 0,
-                  }]}>
-                    <Text style={styles.dispatchDurationInfoLabel}>Ida e volta</Text>
-                    <Text style={styles.dispatchDurationInfoValue}>
-                      {formatMinutes(dispatch.estimatedRoundTripDurationMinutes)}
-                    </Text>
-                  </View>
-                </View>
+                )}
               </View>
-
-              {isDriverPickerOpen && (
-                <View style={styles.dispatchDriverDropdown}>
-                  <Pressable
-                    style={[
-                      styles.dispatchDriverDropdownItem,
-                      dispatch.driverId == null && styles.dispatchDriverDropdownItemSelected,
-                    ]}
-                    disabled={isAssigningDriver}
-                    onPress={() => {
-                      onAssignDriver(dispatch.id, null);
-                      setIsDriverPickerOpen(false);
-                    }}
-                  >
-                    <Text style={styles.dispatchDriverDropdownItemText}>Sem motorista</Text>
-                  </Pressable>
-
-                  {selectableDrivers.map((driver) => (
-                    <Pressable
-                      key={`${dispatch.id}-${driver.id}`}
-                      style={[
-                        styles.dispatchDriverDropdownItem,
-                        dispatch.driverId === driver.id &&
-                          styles.dispatchDriverDropdownItemSelected,
-                      ]}
-                      disabled={isAssigningDriver}
-                      onPress={() => {
-                        onAssignDriver(dispatch.id, driver.id);
-                        setIsDriverPickerOpen(false);
-                      }}
-                    >
-                      <View style={styles.dispatchDriverDropdownItemMain}>
-                        <Text style={styles.dispatchDriverDropdownItemText}>{driver.name}</Text>
-                        {!driver.active && (
-                          <Text style={styles.dispatchDriverDropdownItemBadge}>Inativo</Text>
-                        )}
-                      </View>
-                      <Text style={styles.dispatchDriverDropdownItemPriority}>
-                        P{driver.priorityLevel}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
-              )}
-            </View>
-          )
-          }
-
-          {!isTakeaway && (
-            <View style={styles.summaryButtonsRow}>
+            ) : (
               <Pressable
-                disabled={isDispatchButtonDisabled}
-                style={[
-                  styles.primaryButton,
-                  isDispatchButtonDisabled && styles.primaryButtonDisabled,
-                ]}
+                style={[styles.dispatchBtn2Primary, isDispatchButtonDisabled && styles.dispatchBtn2PrimaryDisabled]}
                 onPress={() => onDispatch(dispatch.id)}
+                disabled={isDispatchButtonDisabled}
               >
-                <Text style={styles.primaryButtonText}>
+                <Text style={styles.dispatchBtn2PrimaryText}>
                   {isDispatching ? "Despachando..." : "Despachar"}
                 </Text>
               </Pressable>
-              <Pressable style={styles.secondaryButton} onPress={() => onOpenMap(dispatch)}>
-                <Text style={styles.secondaryButtonText}>Ver mapa</Text>
-              </Pressable>
-            </View>
-          )}
-        </View>
+            )}
+          </View>
+        )}
+
       </View>
 
       <View style={styles.ordersColumn}>
@@ -1414,7 +1751,7 @@ function DispatchColumn({
               : "Despachar"
             : isSelectedOrder
               ? "Cancelar"
-              : "Alterar despacho";
+              : "Alterar ordem";
 
           const actionDisabled = isTakeawayOrder
             ? order.delivered || isTakeawayOrderDispatching
@@ -1450,26 +1787,31 @@ function DispatchColumn({
                     onStartMove(order.id, dispatch.id, currentIndex);
                   }
                 }}
+                onMarkDelivered={() => onMarkOrderDelivered(order.id)}
+                isMarkingDelivered={!!markingOrderDeliveredById[order.id]}
               />
               {isMoveMode && renderInsertSlot(currentIndex + 1)}
             </View>
           );
         })}
       </View>
-    </ScrollView>
+    </View>
+   </ScrollView>
   );
 }
 
 export default function Dispatch() {
   const insets = useSafeAreaInsets();
+  const { token, owner, signOut } = useAuth();
   const [dispatches, setDispatches] = useState<TDispatch[]>([]);
-  const [isCreateOrderModalOpen, setIsCreateOrderModalOpen] = useState(false);
+  const [isPOSOpen, setIsPOSOpen] = useState(false);
+  const [posEditOrder, setPosEditOrder] = useState<TDispatchOrder | null>(null);
   const [isUpdateOrderModalOpen, setIsUpdateOrderModalOpen] = useState(false);
   const [orderToUpdate, setOrderToUpdate] = useState<TOrderEditorInitialOrder | null>(null);
   const [drivers, setDrivers] = useState<TDriver[]>([]);
   const [driversLoading, setDriversLoading] = useState(true);
   const [driversError, setDriversError] = useState<string | null>(null);
-  const [driversMenuOpen, setDriversMenuOpen] = useState(false);
+  const [driversModalOpen, setDriversModalOpen] = useState(false);
   const [updatingDriverIds, setUpdatingDriverIds] = useState<Record<string, boolean>>({});
   const [assigningDriverDispatchIds, setAssigningDriverDispatchIds] = useState<
     Record<string, boolean>
@@ -1482,6 +1824,8 @@ export default function Dispatch() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [dispatchingIds, setDispatchingIds] = useState<Record<string, boolean>>({});
+  const [markingDeliveredIds, setMarkingDeliveredIds] = useState<Record<string, boolean>>({});
+  const [finalizingIds, setFinalizingIds] = useState<Record<string, boolean>>({});
   const [dispatchingTakeawayOrderIds, setDispatchingTakeawayOrderIds] = useState<
     Record<string, boolean>
   >({});
@@ -1493,15 +1837,31 @@ export default function Dispatch() {
     null
   );
   const [routeCoordinates, setRouteCoordinates] = useState<TRouteCoordinate[]>([]);
+  const [segmentDurationsSeconds, setSegmentDurationsSeconds] = useState<number[]>([]);
   const [routeLoading, setRouteLoading] = useState(false);
   const drawerTranslateX = useRef(new Animated.Value(MAP_MODAL_SLIDE_DISTANCE)).current;
 
   useEffect(() => {
+    if (!error) return;
+
+    const timeoutId = setTimeout(() => {
+      setError(null);
+    }, 3500);
+
+    return () => clearTimeout(timeoutId);
+  }, [error]);
+
+  useEffect(() => {
+    if (!token) return;
     const watcher = watchDispatches({
+      token,
       intervalMs: DISPATCH_POLL_INTERVAL_MS,
       onDispatches: (nextDispatches) => {
         setError(null);
         setDispatches(nextDispatches);
+        setSelectedDispatchForMap((previous) =>
+          previous ? nextDispatches.find((dispatch) => dispatch.id === previous.id) ?? null : previous
+        );
         setLoading(false);
       },
       onError: (fetchError) => {
@@ -1515,14 +1875,15 @@ export default function Dispatch() {
     return () => {
       watcher.stop();
     };
-  }, []);
+  }, [token]);
 
   useEffect(() => {
+    if (!token) return;
     let cancelled = false;
 
     const loadDrivers = async () => {
       try {
-        const nextDrivers = await fetchDrivers();
+        const nextDrivers = await fetchDrivers(token);
         if (cancelled) return;
         setDrivers(nextDrivers);
         setDriversError(null);
@@ -1547,7 +1908,7 @@ export default function Dispatch() {
       cancelled = true;
       clearInterval(intervalId);
     };
-  }, []);
+  }, [token]);
 
   const sortedDispatches = useMemo(() => getSortedDispatches(dispatches), [dispatches]);
 
@@ -1564,9 +1925,21 @@ export default function Dispatch() {
     () => getSortedDrivers(drivers),
     [drivers]
   );
-  const activeDriversCount = useMemo(
+  const trackedDriversCount = useMemo(
     () => drivers.filter((driver) => driver.active).length,
     [drivers]
+  );
+  const driversOnDelivery = useMemo(
+    () => new Set(
+      dispatches
+        .filter((d) => d.dispatched && !isDispatchCompleted(d) && d.driverId)
+        .map((d) => d.driverId!)
+    ),
+    [dispatches]
+  );
+  const totalActiveOrders = useMemo(
+    () => columns.reduce((sum, d) => sum + d.orders.length, 0),
+    [columns],
   );
   const routePoints = useMemo(() => {
     if (!selectedDispatchForMap) return [];
@@ -1591,19 +1964,22 @@ export default function Dispatch() {
     const loadDrivingRoute = async () => {
       if (mapRoutePoints.length < 2) {
         setRouteCoordinates([]);
+        setSegmentDurationsSeconds([]);
         return;
       }
 
       setRouteLoading(true);
 
       try {
-        const drivingCoordinates = await fetchDrivingRouteCoordinates(mapRoutePoints);
+        const result = await fetchDrivingRouteCoordinates(mapRoutePoints);
         if (isCancelled) return;
 
-        setRouteCoordinates(drivingCoordinates ?? toDirectRouteCoordinates(mapRoutePoints));
+        setRouteCoordinates(result?.coordinates ?? toDirectRouteCoordinates(mapRoutePoints));
+        setSegmentDurationsSeconds(result?.legDurationsSeconds ?? []);
       } catch {
         if (isCancelled) return;
         setRouteCoordinates(toDirectRouteCoordinates(mapRoutePoints));
+        setSegmentDurationsSeconds([]);
       } finally {
         if (!isCancelled) {
           setRouteLoading(false);
@@ -1652,11 +2028,30 @@ export default function Dispatch() {
     }
   };
 
-  const refreshDispatches = async () => {
+  const handleOpenFullRouteInGoogleMaps = async () => {
+    if (routePoints.length === 0) return;
+    const enc = encodeURIComponent;
+    const origin = enc(ROUTE_ORIGIN.mapQuery);
+    const dest = enc(routePoints[routePoints.length - 1].mapQuery);
+    const waypoints = routePoints.slice(0, -1).map((p) => enc(p.mapQuery)).join("|");
+    let url = `https://www.google.com/maps/dir/?api=1&origin=${origin}&destination=${dest}&travelmode=driving`;
+    if (waypoints) url += `&waypoints=${waypoints}`;
     try {
-      const latestDispatches = await fetchDispatches();
+      await Linking.openURL(url);
+    } catch {
+      Alert.alert("Erro", "Não foi possível abrir o Google Maps.");
+    }
+  };
+
+  const refreshDispatches = async () => {
+    if (!token) return;
+    try {
+      const latestDispatches = await fetchDispatches(token);
       setError(null);
       setDispatches(latestDispatches);
+      setSelectedDispatchForMap((previous) =>
+        previous ? latestDispatches.find((dispatch) => dispatch.id === previous.id) ?? null : previous
+      );
     } catch (fetchError) {
       const message =
         fetchError instanceof Error ? fetchError.message : "Falha ao buscar entregas";
@@ -1667,8 +2062,9 @@ export default function Dispatch() {
   };
 
   const refreshDrivers = async () => {
+    if (!token) return;
     try {
-      const latestDrivers = await fetchDrivers();
+      const latestDrivers = await fetchDrivers(token);
       setDrivers(latestDrivers);
       setDriversError(null);
     } catch (fetchError) {
@@ -1687,7 +2083,7 @@ export default function Dispatch() {
       setIsMoveBusy(true);
       setError(null);
 
-      await moveDispatchOrder(movingOrderId, payload);
+      await moveDispatchOrder(movingOrderId, payload, token!);
       setMovingOrderId(null);
       setMovingSourceDispatchId(null);
       setMovingSourceOrderIndex(null);
@@ -1776,6 +2172,30 @@ export default function Dispatch() {
     setMovingDispatchQueueId(null);
   };
 
+  const handleMoveQueueAdjacent = async (dispatchId: string, delta: number) => {
+    if (updatingDispatchQueueIds[dispatchId]) return;
+    const currentDispatch = dispatches.find((d) => d.id === dispatchId);
+    if (!currentDispatch) return;
+    const currentQueueIndex = getDispatchQueueIndex(currentDispatch);
+    if (currentQueueIndex == null || !Number.isFinite(currentQueueIndex)) return;
+    const targetQueueIndex = currentQueueIndex + delta;
+    if (targetQueueIndex < 1) return;
+    setUpdatingDispatchQueueIds((previous) => ({ ...previous, [dispatchId]: true }));
+    setError(null);
+    try {
+      await updateDispatchStatus(token!, dispatchId, { queueIndex: targetQueueIndex });
+      await refreshDispatches();
+    } catch (updateError) {
+      setError(updateError instanceof Error ? updateError.message : "Falha ao reordenar fila");
+    } finally {
+      setUpdatingDispatchQueueIds((previous) => {
+        const next = { ...previous };
+        delete next[dispatchId];
+        return next;
+      });
+    }
+  };
+
   const handleMoveDispatchQueueToPosition = async (targetQueueIndex: number) => {
     const dispatchId = movingDispatchQueueId;
     if (!dispatchId) return;
@@ -1799,7 +2219,7 @@ export default function Dispatch() {
     setError(null);
 
     try {
-      await updateDispatchStatus(dispatchId, { queueIndex: targetQueueIndex });
+      await updateDispatchStatus(token!, dispatchId, { queueIndex: targetQueueIndex });
       setMovingDispatchQueueId(null);
       await refreshDispatches();
     } catch (updateError) {
@@ -1818,9 +2238,9 @@ export default function Dispatch() {
   };
 
   const handleOpenUpdateOrder = (order: TDispatchOrder) => {
-    setDriversMenuOpen(false);
-    setOrderToUpdate(toOrderEditorInitialOrder(order));
-    setIsUpdateOrderModalOpen(true);
+    setDriversModalOpen(false);
+    setPosEditOrder(order);
+    setIsPOSOpen(true);
   };
 
   const handleDispatch = async (dispatchId: string) => {
@@ -1829,66 +2249,26 @@ export default function Dispatch() {
       return;
     }
 
-    const dispatchAt = new Date().toISOString();
+    const dispatchedAt = new Date().toISOString();
 
     setDispatchingIds((previous) => ({
       ...previous,
       [dispatchId]: true,
     }));
     setError(null);
-    setDispatches((previous) =>
-      previous.map((item) =>
-        item.id === dispatchId
-          ? {
-            ...item,
-            dispatched: true,
-            dispatchAt,
-          }
-          : item
-      )
-    );
-    setSelectedDispatchForMap((previous) =>
-      previous && previous.id === dispatchId
-        ? {
-          ...previous,
-          dispatched: true,
-          dispatchAt,
-        }
-        : previous
-    );
 
     try {
-      await updateDispatchStatus(dispatchId, {
+      await updateDispatchStatus(token!, dispatchId, {
         dispatched: true,
-        dispatchAt,
+        dispatchedAt,
       });
+      await refreshDispatches();
     } catch (updateError) {
       const message =
         updateError instanceof Error
           ? updateError.message
           : "Falha ao atualizar despacho";
       setError(message);
-
-      setDispatches((previous) =>
-        previous.map((item) =>
-          item.id === dispatchId
-            ? {
-              ...item,
-              dispatched: currentDispatch.dispatched,
-              dispatchAt: currentDispatch.dispatchAt ?? null,
-            }
-            : item
-        )
-      );
-      setSelectedDispatchForMap((previous) =>
-        previous && previous.id === dispatchId
-          ? {
-            ...previous,
-            dispatched: currentDispatch.dispatched,
-            dispatchAt: currentDispatch.dispatchAt ?? null,
-          }
-          : previous
-      );
     } finally {
       setDispatchingIds((previous) => {
         const next = { ...previous };
@@ -1963,7 +2343,7 @@ export default function Dispatch() {
     );
 
     try {
-      await updateDispatchStatus(dispatchId, { driverId: normalizedNextDriverId });
+      await updateDispatchStatus(token!, dispatchId, { driverId: normalizedNextDriverId });
       await refreshDispatches();
     } catch (assignError) {
       const message =
@@ -2039,7 +2419,7 @@ export default function Dispatch() {
     );
 
     try {
-      await updateOrder(orderId, { deliveredAt });
+      await updateOrder(orderId, { deliveredAt }, token!);
       await refreshDispatches();
     } catch (updateError) {
       const message =
@@ -2085,53 +2465,36 @@ export default function Dispatch() {
     }
   };
 
-  const handleToggleDriverActive = async (driverId: string, nextActive: boolean) => {
-    const currentDriver = drivers.find((driver) => driver.id === driverId);
-    if (!currentDriver || updatingDriverIds[driverId]) {
-      return;
-    }
+  const handleMarkOrderDelivered = async (orderId: string) => {
+    if (markingDeliveredIds[orderId]) return;
+    if (!token) return;
 
-    setUpdatingDriverIds((previous) => ({
-      ...previous,
-      [driverId]: true,
-    }));
-    setDrivers((previous) =>
-      previous.map((driver) =>
-        driver.id === driverId
-          ? {
-            ...driver,
-            active: nextActive,
-          }
-          : driver
-      )
-    );
-    setDriversError(null);
+    const deliveredAt = new Date().toISOString();
+    setMarkingDeliveredIds((prev) => ({ ...prev, [orderId]: true }));
+    setError(null);
 
     try {
-      await updateDriver(driverId, { active: nextActive });
-      await refreshDrivers();
-    } catch (updateError) {
-      const message =
-        updateError instanceof Error
-          ? updateError.message
-          : "Falha ao atualizar motorista";
-      setDriversError(message);
-      setDrivers((previous) =>
-        previous.map((driver) =>
-          driver.id === driverId
-            ? {
-              ...driver,
-              active: currentDriver.active,
-            }
-            : driver
-        )
-      );
+      await updateOrder(orderId, { deliveredAt }, token);
+      await refreshDispatches();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Falha ao marcar entregue");
     } finally {
-      setUpdatingDriverIds((previous) => {
-        const next = { ...previous };
-        delete next[driverId];
-        return next;
-      });
+      setMarkingDeliveredIds((prev) => { const next = { ...prev }; delete next[orderId]; return next; });
+    }
+  };
+
+  const handleFinalize = async (dispatchId: string) => {
+    if (finalizingIds[dispatchId]) return;
+    if (!token) return;
+    setFinalizingIds((prev) => ({ ...prev, [dispatchId]: true }));
+    setError(null);
+    try {
+      await finalizeDispatch(dispatchId, token);
+      await refreshDispatches();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Falha ao finalizar despacho");
+    } finally {
+      setFinalizingIds((prev) => { const next = { ...prev }; delete next[dispatchId]; return next; });
     }
   };
 
@@ -2154,7 +2517,7 @@ export default function Dispatch() {
     setDriversError(null);
 
     try {
-      await updateDriver(driverId, { priorityLevel: targetPriorityLevel });
+      await updateDriver(token!, driverId, { priorityLevel: targetPriorityLevel });
       await refreshDrivers();
     } catch (updateError) {
       const message =
@@ -2176,181 +2539,108 @@ export default function Dispatch() {
       <SafeAreaView style={styles.safeArea}>
 
 
-        <View style={styles.topBar}>
-          <BackToSitemapButton />
-          <View style={styles.topBarActions}>
-            <View style={styles.dispatchTabs}>
-              <Pressable
-                style={[
-                  styles.dispatchTab,
-                  dispatchTab === "ACTIVE" && styles.dispatchTabActive,
-                ]}
-                onPress={() => {
-                  setDispatchTab("ACTIVE");
-                  handleCancelMove();
-                  setMovingDispatchQueueId(null);
-                  setDriversMenuOpen(false);
-                }}
-              >
-                <Text
-                  style={[
-                    styles.dispatchTabText,
-                    dispatchTab === "ACTIVE" && styles.dispatchTabTextActive,
-                  ]}
-                >
-                  Ativos
-                </Text>
-              </Pressable>
-              <Pressable
-                style={[
-                  styles.dispatchTab,
-                  dispatchTab === "COMPLETED" && styles.dispatchTabActive,
-                ]}
-                onPress={() => {
-                  setDispatchTab("COMPLETED");
-                  handleCancelMove();
-                  setMovingDispatchQueueId(null);
-                  setDriversMenuOpen(false);
-                }}
-              >
-                <Text
-                  style={[
-                    styles.dispatchTabText,
-                    dispatchTab === "COMPLETED" && styles.dispatchTabTextActive,
-                  ]}
-                >
-                  Concluidos
-                </Text>
-              </Pressable>
-            </View>
+        <TabletTopBar
+          mode="inner"
+          pageTitle="Despacho"
+          backLabel="Início"
+          onBack={() => router.replace("/(app)")}
+          userInitial={(owner?.name ?? "G").charAt(0).toUpperCase()}
+          onAvatarPress={() => void signOut()}
+        />
 
+        {/* ── Topbar ── */}
+        <View style={styles.topBar}>
+          {/* Left: segmented view switcher */}
+          <View style={styles.topBarSegmented}>
             <Pressable
-              style={styles.createOrderButton}
-              onPress={() => {
-                setDriversMenuOpen(false);
-                setMovingDispatchQueueId(null);
-                setIsCreateOrderModalOpen(true);
-              }}
+              style={[styles.segmentBtn, dispatchTab === "ACTIVE" && styles.segmentBtnActive]}
+              onPress={() => { setDispatchTab("ACTIVE"); handleCancelMove(); setMovingDispatchQueueId(null); }}
             >
-              <Feather name="plus-circle" size={16} color="#ffffff" />
-              <Text style={styles.createOrderButtonText}>Novo pedido</Text>
+              {dispatchTab === "ACTIVE" && <Feather name="check" size={12} color="#FF3D14" />}
+              <Text style={[styles.segmentBtnText, dispatchTab === "ACTIVE" && styles.segmentBtnTextActive]}>Ativos</Text>
+              {dispatchTab === "ACTIVE" && (
+                <Text style={styles.segmentCount}>{totalActiveOrders}</Text>
+              )}
+            </Pressable>
+            <Pressable
+              style={[styles.segmentBtn, dispatchTab === "COMPLETED" && styles.segmentBtnActive]}
+              onPress={() => { setDispatchTab("COMPLETED"); handleCancelMove(); setMovingDispatchQueueId(null); }}
+            >
+              {dispatchTab === "COMPLETED" && <Feather name="check" size={12} color="#FF3D14" />}
+              <Text style={[styles.segmentBtnText, dispatchTab === "COMPLETED" && styles.segmentBtnTextActive]}>Concluídos</Text>
+            </Pressable>
+          </View>
+
+          <View style={{ flex: 1 }} />
+
+          {/* Right: driver filter + novo pedido */}
+          <View style={styles.topBarRight}>
+            <Pressable
+              style={styles.driversBtn}
+              onPress={() => setDriversModalOpen(true)}
+            >
+              <Feather
+                name="users"
+                size={16}
+                color="rgba(250,245,238,0.5)"
+              />
+              <Text style={styles.driversBtnLabel}>
+                Motoristas:
+              </Text>
+              <View style={styles.driversBtnCountRow}>
+                <View style={[styles.driversBtnDot, { backgroundColor: trackedDriversCount === 0 ? "#6C6259" : "#00A866" }]} />
+                <Text style={styles.driversBtnCountText}>
+                  {trackedDriversCount} {trackedDriversCount === 1 ? "rastreado" : "rastreados"}
+                </Text>
+              </View>
+              <Feather name="chevron-down" size={14} color="rgba(250,245,238,0.35)" />
             </Pressable>
 
-            <View style={styles.driversMenuContainer}>
-              <Pressable
-                style={styles.driversButton}
-                onPress={() => setDriversMenuOpen((previous) => !previous)}
-              >
-                <Feather name="users" size={16} color="#2d2d2d" />
-                <Text style={styles.driversButtonText}>{activeDriversCount} ativos</Text>
-                <Feather
-                  name={driversMenuOpen ? "chevron-up" : "chevron-down"}
-                  size={16}
-                  color="#666666"
-                />
-              </Pressable>
-
-              {driversMenuOpen && (
-                <View style={styles.driversDropdown}>
-                  <Text style={styles.driversDropdownTitle}>Motoristas</Text>
-                  {driversLoading ? (
-                    <Text style={styles.driversDropdownFeedback}>Carregando...</Text>
-                  ) : driversError ? (
-                    <Text style={styles.driversDropdownError}>{driversError}</Text>
-                  ) : sortedDrivers.length === 0 ? (
-                    <Text style={styles.driversDropdownFeedback}>Nenhum motorista</Text>
-                  ) : (
-                    <View style={styles.driversDropdownList}>
-                      {sortedDrivers.map((driver, index) => {
-                        const isUpdating = !!updatingDriverIds[driver.id];
-                        const isFirst = index === 0;
-                        const isLast = index === sortedDrivers.length - 1;
-                        return (
-                          <View key={driver.id} style={styles.driverRow}>
-                            <View style={styles.driverRowNameWrap}>
-                              <Text style={styles.driverRowName}>{driver.name}</Text>
-                              <Text style={styles.driverRowMeta}>
-                                Prioridade {driver.priorityLevel}
-                              </Text>
-                            </View>
-                            <View style={styles.driverRowActions}>
-                              <View style={styles.driverPriorityControls}>
-                                <Pressable
-                                  style={[
-                                    styles.driverPriorityButton,
-                                    (isUpdating || isFirst) && styles.driverPriorityButtonDisabled,
-                                  ]}
-                                  disabled={isUpdating || isFirst}
-                                  onPress={() => handleMoveDriverPriority(driver.id, "UP")}
-                                >
-                                  <Feather name="chevron-up" size={14} color="#555e68" />
-                                </Pressable>
-                                <Pressable
-                                  style={[
-                                    styles.driverPriorityButton,
-                                    (isUpdating || isLast) && styles.driverPriorityButtonDisabled,
-                                  ]}
-                                  disabled={isUpdating || isLast}
-                                  onPress={() => handleMoveDriverPriority(driver.id, "DOWN")}
-                                >
-                                  <Feather name="chevron-down" size={14} color="#555e68" />
-                                </Pressable>
-                              </View>
-
-                              <Pressable
-                                style={[
-                                  styles.driverToggleButton,
-                                  driver.active
-                                    ? styles.driverToggleButtonActive
-                                    : styles.driverToggleButtonInactive,
-                                  isUpdating && styles.driverToggleButtonDisabled,
-                                ]}
-                                disabled={isUpdating}
-                                onPress={() =>
-                                  handleToggleDriverActive(driver.id, !driver.active)
-                                }
-                              >
-                                <Text
-                                  style={[
-                                    styles.driverToggleButtonText,
-                                    driver.active
-                                      ? styles.driverToggleButtonTextActive
-                                      : styles.driverToggleButtonTextInactive,
-                                  ]}
-                                >
-                                  {isUpdating
-                                    ? "..."
-                                    : driver.active
-                                      ? "Ativo"
-                                      : "Inativo"}
-                                </Text>
-                              </Pressable>
-                            </View>
-                          </View>
-                        );
-                      })}
-                    </View>
-                  )}
-                </View>
-              )}
-            </View>
+            <Pressable
+              style={styles.novoPedidoBtn}
+              onPress={() => { setDriversModalOpen(false); setMovingDispatchQueueId(null); setIsPOSOpen(true); }}
+            >
+              <Feather name="plus" size={17} color="#fff" />
+              <Text style={styles.novoPedidoBtnText}>Novo pedido</Text>
+            </Pressable>
           </View>
         </View>
 
         <View style={styles.body}>
           {loading ? (
-            <Text style={styles.feedbackText}>Carregando entregas...</Text>
-          ) : error ? (
-            <Text style={styles.errorText}>{error}</Text>
+            <View style={styles.loadingState}>
+              <Text style={styles.loadingText}>Carregando entregas...</Text>
+            </View>
           ) : columns.length === 0 ? (
-            <Text style={styles.feedbackText}>
-              {dispatchTab === "COMPLETED"
-                ? "Nenhum despacho concluido."
-                : "Nenhum despacho ativo."}
-            </Text>
+            <View style={styles.emptyState}>
+              <View style={styles.emptyStateIconTile}>
+                <Feather
+                  name={dispatchTab === "ACTIVE" ? "package" : "check-circle"}
+                  size={34}
+                  color="#FF3D14"
+                />
+              </View>
+              <Text style={styles.emptyStateTitle}>
+                {dispatchTab === "ACTIVE" ? "Nenhum despacho ativo" : "Nenhum despacho concluído"}
+              </Text>
+              <Text style={styles.emptyStateSub}>
+                {dispatchTab === "ACTIVE"
+                  ? "Tudo limpo por aqui. Novos pedidos aparecem automaticamente quando chegam."
+                  : "Os despachos finalizados do dia aparecem aqui assim que forem entregues ou retirados."}
+              </Text>
+              {dispatchTab === "ACTIVE" && (
+                <Pressable
+                  style={styles.emptyStateCTA}
+                  onPress={() => { setMovingDispatchQueueId(null); setIsPOSOpen(true); }}
+                >
+                  <Feather name="plus" size={17} color="#fff" />
+                  <Text style={styles.emptyStateCTAText}>Novo pedido</Text>
+                </Pressable>
+              )}
+            </View>
           ) : (
-            <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.columnsRow}>
-              {columns.map((dispatch) => {
+            <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.columnsScrollView} contentContainerStyle={styles.columnsRow}>
+              {columns.map((dispatch, index) => {
                 const targetQueueIndex = getDispatchQueueIndex(dispatch);
                 return (
                   <DispatchColumn
@@ -2358,6 +2648,7 @@ export default function Dispatch() {
                     dispatch={dispatch}
                     targetQueueIndex={targetQueueIndex}
                     drivers={sortedDrivers}
+                    driversOnDelivery={driversOnDelivery}
                     isDispatching={!!dispatchingIds[dispatch.id]}
                     isAssigningDriver={!!assigningDriverDispatchIds[dispatch.id]}
                     isQueueUpdating={!!updatingDispatchQueueIds[dispatch.id]}
@@ -2381,11 +2672,19 @@ export default function Dispatch() {
                     }
                     onOpenOrder={handleOpenUpdateOrder}
                     onOpenMap={openMapDrawer}
+                    isFirstInQueue={index === 0}
+                    isLastInQueue={index === columns.length - 1}
+                    onMoveQueueLeft={() => handleMoveQueueAdjacent(dispatch.id, -1)}
+                    onMoveQueueRight={() => handleMoveQueueAdjacent(dispatch.id, 1)}
+                    onMarkOrderDelivered={handleMarkOrderDelivered}
+                    markingOrderDeliveredById={markingDeliveredIds}
+                    onFinalize={handleFinalize}
+                    isFinalizing={!!finalizingIds[dispatch.id]}
                   />
                 );
               })}
               {movingOrderId && (
-                <View style={[styles.dispatchColumn, { paddingTop: 24 }]}>
+                <View style={[styles.dispatchColumn, { paddingTop: 24, backgroundColor: "transparent", borderColor: "transparent" }]}>
                   <Pressable
                     style={[
                       styles.dispatchDropCard,
@@ -2396,7 +2695,10 @@ export default function Dispatch() {
                     onPress={handleCreateNewDispatchWithOrder}
                     disabled={!movingOrderId || isMoveBusy}
                   >
-                    <Feather name="plus" size={28} color="#666666" />
+                    {isMoveBusy
+                      ? <ActivityIndicator size="small" color="rgba(250,245,238,0.5)" />
+                      : <Feather name="plus" size={28} color="rgba(250,245,238,0.4)" />
+                    }
                   </Pressable>
                 </View>
               )}
@@ -2404,92 +2706,242 @@ export default function Dispatch() {
           )}
         </View>
 
-        {selectedDispatchForMap && (
-          <View style={styles.mapDrawerLayer}>
-            <Pressable style={styles.mapDrawerBackdrop} onPress={closeMapDrawer} />
-            <Animated.View
-              style={[
-                styles.mapDrawer,
-                {
-                  paddingTop: Math.max(insets.top, 0) + 12,
-                  paddingBottom: Math.max(insets.bottom, 0) + 12,
-                },
-                { transform: [{ translateX: drawerTranslateX }] },
-              ]}
-            >
-              <View style={styles.mapDrawerHeader}>
-                <View>
-                  <Text style={styles.mapDrawerTitle}>Rota de Entrega</Text>
-                  <Text style={styles.mapDrawerSubtitle}>
-                    Origem + pontos de entrega
-                  </Text>
-                </View>
-                <Pressable style={styles.mapDrawerCloseButton} onPress={closeMapDrawer}>
-                  <Feather name="x" size={18} color="#2d2d2d" />
-                </Pressable>
+        {/* ── Route map modal (fullscreen) ── */}
+        <Modal
+          visible={!!selectedDispatchForMap}
+          animationType="slide"
+          presentationStyle="fullScreen"
+          onRequestClose={closeMapDrawer}
+        >
+          <View style={[styles.routeModal, { paddingTop: insets.top }]}>
+            {/* top bar */}
+            <View style={styles.routeModalTopBar}>
+              <View style={styles.routeModalIconWrap}>
+                <Feather name="map" size={20} color="#FF3D14" />
               </View>
+              <View style={{ flex: 1, minWidth: 0 }}>
+                <Text style={styles.routeModalTitle}>Rota da entrega</Text>
+                <Text style={styles.routeModalSub} numberOfLines={1}>
+                  {selectedDispatchForMap?.driver?.name ?? "Motorista"} · {routePoints.length} {routePoints.length === 1 ? "parada" : "paradas"}
+                </Text>
+              </View>
+              <View style={styles.routeModalTimePill}>
+                <Feather name="clock" size={14} color="#FF3D14" />
+                <Text style={styles.routeModalTimePillText}>
+                  {formatMinutes(selectedDispatchForMap?.estimatedDeliveryDurationMinutes ?? 0)}
+                </Text>
+                {routeLoading && <Text style={styles.routeModalTimePillSub}> · calculando</Text>}
+              </View>
+              <Pressable style={styles.routeModalCloseBtn} onPress={closeMapDrawer}>
+                <Feather name="x" size={18} color="rgba(250,245,238,0.7)" />
+              </Pressable>
+            </View>
 
-              <View style={styles.routeContentRow}>
+            {/* body */}
+            <View style={styles.routeModalBody}>
+              {/* map */}
+              <View style={styles.routeModalMapArea}>
                 {mapRoutePoints.length >= 2 ? (
                   <DispatchRouteMap
-                    style={styles.routeMapInteractive}
+                    style={{ flex: 1 }}
                     region={routeRegion}
                     points={mapRoutePoints}
                     coordinates={routeLineCoordinates}
                   />
                 ) : (
-                  <View style={[styles.mapFallbackCard, styles.routeMapFallbackCard]}>
-                    <Text style={styles.mapFallbackText}>
+                  <View style={styles.routeModalMapFallback}>
+                    <Feather name="map" size={32} color="rgba(250,245,238,0.2)" />
+                    <Text style={styles.routeModalMapFallbackText}>
                       Sem coordenadas suficientes para montar o mapa desta entrega.
                     </Text>
                   </View>
                 )}
-
-                <View style={styles.routePointsPanel}>
-                  {routeLoading && (
-                    <Text style={styles.routeLoadingText}>Calculando rota de carro...</Text>
-                  )}
-                  <ScrollView
-                    style={styles.routePointsScroll}
-                    contentContainerStyle={styles.routePointsBlock}
-                    showsVerticalScrollIndicator={false}
-                  >
-                    {routePoints.map((point, index) => (
-                      <View key={`${point.lat}-${point.lng}-${index}`} style={styles.routePointRow}>
-                        <View style={styles.routePointIndex}>
-                          <Text style={styles.routePointIndexText}>{index + 1}</Text>
-                        </View>
-                        <View style={styles.routePointTextBlock}>
-                          <Text style={styles.routePointLabel}>{point.label}</Text>
-                          <Text style={styles.routePointAddress}>{point.address}</Text>
-                        </View>
-                        <Pressable
-                          style={styles.routePointMapsButton}
-                          onPress={() => {
-                            void handleOpenRoutePointInGoogleMaps(point);
-                          }}
-                        >
-                          <Feather name="map" size={14} color="#1e5da9" />
-                          <Text style={styles.routePointMapsButtonText}>Google Maps</Text>
-                        </Pressable>
-                      </View>
-                    ))}
-                  </ScrollView>
-                </View>
               </View>
-            </Animated.View>
-          </View>
-        )}
 
-        <CreateOrderModal
-          visible={isCreateOrderModalOpen}
-          apiBaseUrl={API_BASE_URL}
-          onClose={() => setIsCreateOrderModalOpen(false)}
-        />
+              {/* stops panel */}
+              <View style={[styles.routeModalPanel, { paddingBottom: Math.max(insets.bottom, 16) }]}>
+                {/* open full route CTA */}
+                <View style={styles.routeModalPanelHeader}>
+                  <Pressable
+                    style={styles.routeModalFullRouteBtn}
+                    onPress={() => { void handleOpenFullRouteInGoogleMaps(); }}
+                  >
+                    <Feather name="navigation" size={16} color="#fff" />
+                    <Text style={styles.routeModalFullRouteBtnText}>Abrir rota completa</Text>
+                    <Feather name="external-link" size={14} color="rgba(255,255,255,0.75)" />
+                  </Pressable>
+                </View>
+
+                {/* stops list */}
+                <ScrollView
+                  style={{ flex: 1 }}
+                  contentContainerStyle={styles.routeModalStopsList}
+                  showsVerticalScrollIndicator={false}
+                >
+                  {/* Origin */}
+                  <View style={styles.routeStopRow}>
+                    <View style={styles.routeStopOriginIcon}>
+                      <Feather name="home" size={18} color="#fff" />
+                    </View>
+                    <View style={styles.routeStopInfo}>
+                      <Text style={styles.routeStopEyebrow}>COLETA</Text>
+                      <Text style={styles.routeStopTitle}>{ROUTE_ORIGIN.label}</Text>
+                      <Text style={styles.routeStopAddress}>{ROUTE_ORIGIN.address}</Text>
+                    </View>
+                  </View>
+
+                  {routePoints.map((point, index) => (
+                    <View key={`${point.lat}-${point.lng}-${index}`}>
+                      {/* connector */}
+                      <View style={styles.routeConnector}>
+                        <View style={styles.routeConnectorLine} />
+                      </View>
+                      {/* stop */}
+                      <View style={styles.routeStopRow}>
+                        <View style={styles.routeStopNumBubble}>
+                          <Text style={styles.routeStopNumText}>{index + 1}</Text>
+                        </View>
+                        <View style={styles.routeStopInfo}>
+                          <View style={styles.routeStopTitleRow}>
+                            <Text style={[styles.routeStopTitle, { flex: 1 }]} numberOfLines={1}>{point.label}</Text>
+                            {segmentDurationsSeconds[index] != null && segmentDurationsSeconds[index] > 0 && (
+                              <View style={styles.routeConnectorTimePill}>
+                                <Text style={styles.routeConnectorTimeText}>
+                                  {Math.round(segmentDurationsSeconds[index] / 60)} min
+                                </Text>
+                              </View>
+                            )}
+                          </View>
+                          <View style={styles.routeStopAddressRow}>
+                            <Feather name="map-pin" size={12} color="rgba(250,245,238,0.45)" />
+                            <Text style={styles.routeStopAddress} numberOfLines={2}>{point.address}</Text>
+                          </View>
+                          {point.complement ? (
+                            <View style={styles.routeStopComplRow}>
+                              <Text style={styles.routeStopComplLabel}>Compl:</Text>
+                              <Text style={styles.routeStopCompl}>{point.complement}</Text>
+                            </View>
+                          ) : null}
+                          <Pressable
+                            style={styles.routeStopMapsBtn}
+                            onPress={() => { void handleOpenRoutePointInGoogleMaps(point); }}
+                          >
+                            <Feather name="map-pin" size={12} color="rgba(250,245,238,0.5)" />
+                            <Text style={styles.routeStopMapsBtnText}>Abrir endereço</Text>
+                            <Feather name="external-link" size={11} color="rgba(250,245,238,0.3)" />
+                          </Pressable>
+                        </View>
+                      </View>
+                    </View>
+                  ))}
+
+                  {/* Return connector + stop */}
+                  <View style={styles.routeConnector}>
+                    <View style={[styles.routeConnectorLine, styles.routeConnectorLineDashed]} />
+                  </View>
+                  <View style={styles.routeStopRow}>
+                    <View style={[styles.routeStopOriginIcon, styles.routeStopReturnIcon]}>
+                      <Feather name="flag" size={16} color="rgba(250,245,238,0.5)" />
+                    </View>
+                    <View style={styles.routeStopInfo}>
+                      <Text style={[styles.routeStopEyebrow, { color: "rgba(250,245,238,0.3)" }]}>RETORNO</Text>
+                      <Text style={[styles.routeStopTitle, { color: "rgba(250,245,238,0.5)" }]}>{ROUTE_ORIGIN.label}</Text>
+                      <Text style={[styles.routeStopAddress, { color: "rgba(250,245,238,0.3)" }]}>{ROUTE_ORIGIN.address}</Text>
+                    </View>
+                  </View>
+                </ScrollView>
+              </View>
+            </View>
+          </View>
+        </Modal>
+
+        {/* ── Drivers management modal ── */}
+        <Modal
+          visible={driversModalOpen}
+          transparent
+          animationType="fade"
+          onRequestClose={() => setDriversModalOpen(false)}
+        >
+          <Pressable style={styles.driversModalBackdrop} onPress={() => setDriversModalOpen(false)}>
+            <Pressable style={styles.driversModalPanel} onPress={(e) => e.stopPropagation()}>
+              {/* header */}
+              <View style={styles.driversModalHeader}>
+                <View style={styles.driversModalIconWrap}>
+                  <Feather name="users" size={19} color="#FF3D14" />
+                </View>
+                <Text style={styles.driversModalTitle}>Motoristas</Text>
+                <Pressable style={styles.driversModalCloseBtn} onPress={() => setDriversModalOpen(false)}>
+                  <Feather name="x" size={17} color="rgba(250,245,238,0.7)" />
+                </Pressable>
+              </View>
+
+              {/* driver list */}
+              <ScrollView
+                style={styles.driversModalList}
+                contentContainerStyle={{ paddingVertical: 6 }}
+                showsVerticalScrollIndicator={false}
+              >
+                {driversLoading ? (
+                  <Text style={styles.driversModalFeedback}>Carregando...</Text>
+                ) : driversError ? (
+                  <Text style={styles.driversModalFeedbackError}>{driversError}</Text>
+                ) : sortedDrivers.length === 0 ? (
+                  <Text style={styles.driversModalFeedback}>Nenhum motorista cadastrado.</Text>
+                ) : (
+                  sortedDrivers.map((driver, index) => {
+                    const isOnDelivery = driversOnDelivery.has(driver.id);
+                    const driverStatus = isOnDelivery ? "entrega" : driver.active ? "rastreando" : "semsinal";
+                    const initials = driver.name.split(" ").filter(Boolean).map((w: string) => w[0].toUpperCase()).slice(0, 2).join("");
+                    const active = driver.active;
+                    const statusCfg = driverStatus === "entrega"
+                      ? { label: "Em entrega", dot: "#FF7A5C", fg: "#FF7A5C", bg: "rgba(255,61,20,0.12)" }
+                      : driverStatus === "rastreando"
+                        ? { label: "Rastreando", dot: "#34D98A", fg: "#34D98A", bg: "rgba(0,168,102,0.12)" }
+                        : { label: "Sem sinal", dot: "#6C6259", fg: "#9C8E83", bg: "rgba(239,231,218,0.06)" };
+                    return (
+                      <View key={driver.id} style={[styles.driversModalRow, index > 0 && styles.driversModalRowBorder]}>
+                        {/* avatar */}
+                        <View style={[styles.driversModalAvatar, !active && styles.driversModalAvatarInactive]}>
+                          <Text style={[styles.driversModalAvatarText, !active && { color: "rgba(250,245,238,0.3)" }]}>{initials}</Text>
+                        </View>
+                        {/* name + priority */}
+                        <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                          <Text style={[styles.driversModalName, !active && { color: "#9C8E83" }]} numberOfLines={1}>{driver.name}</Text>
+                          <Text style={styles.driversModalPriority}>P{driver.priorityLevel}</Text>
+                        </View>
+                        {/* status badge */}
+                        <View style={[styles.driversModalBadge, { backgroundColor: statusCfg.bg }]}>
+                          <View style={[styles.driversModalBadgeDot, { backgroundColor: statusCfg.dot }]} />
+                          <Text style={[styles.driversModalBadgeText, { color: statusCfg.fg }]}>{statusCfg.label}</Text>
+                        </View>
+                      </View>
+                    );
+                  })
+                )}
+              </ScrollView>
+            </Pressable>
+          </Pressable>
+        </Modal>
+
+        <Modal
+          visible={isPOSOpen}
+          animationType="slide"
+          presentationStyle="fullScreen"
+          onRequestClose={() => { setIsPOSOpen(false); setPosEditOrder(null); }}
+        >
+          <POSScreen
+            key={posEditOrder?.id ?? "new"}
+            onClose={() => { setIsPOSOpen(false); setPosEditOrder(null); }}
+            onOrderCreated={() => { setIsPOSOpen(false); setPosEditOrder(null); void refreshDispatches(); }}
+            onOrderUpdated={() => refreshDispatches()}
+            editOrder={posEditOrder ?? undefined}
+          />
+        </Modal>
 
         <UpdateOrderModal
           visible={isUpdateOrderModalOpen}
           apiBaseUrl={API_BASE_URL}
+          authToken={token ?? ""}
           order={orderToUpdate}
           onSuccess={refreshDispatches}
           onClose={() => {
@@ -2497,1019 +2949,1057 @@ export default function Dispatch() {
             setOrderToUpdate(null);
           }}
         />
+
+        {error ? (
+          <View style={[styles.errorToast, { bottom: Math.max(insets.bottom, 16), right: 16 }]}>
+            <Feather name="alert-circle" size={16} color="#ff8267" />
+            <Text style={styles.errorToastText}>{error}</Text>
+          </View>
+        ) : null}
       </SafeAreaView>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  page: {
-    flex: 1,
-    backgroundColor: "#f9f9f9",
-  },
-  safeArea: {
-    flex: 1,
-  },
+  page: { flex: 1, backgroundColor: "#0e0b09", fontFamily: "Geist_400Regular" },
+  safeArea: { flex: 1 },
   topBar: {
-    backgroundColor: "#ffffff",
-    borderBottomWidth: 1,
-    borderBottomColor: "#dedede",
-    paddingVertical: 20,
-    paddingHorizontal: 28,
-    alignItems: "center",
-    flexDirection: "row",
-    justifyContent: 'space-between',
-    gap: 16,
+    flexShrink: 0,
+    backgroundColor: "#181310",
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.10)",
+    flexDirection: "row", alignItems: "center",
+    paddingHorizontal: 16, paddingVertical: 12, gap: 14,
   },
-  topBarActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 12,
-    zIndex: 20,
+  topBarActions: { flexDirection: "row", alignItems: "center", gap: 10 },
+  // ── New topbar ──
+  topBarSegmented: {
+    flexDirection: "row", gap: 2, height: 40, padding: 3,
+    borderRadius: 10, borderWidth: 1, borderColor: "rgba(239,231,218,0.08)",
+    backgroundColor: "rgba(239,231,218,0.05)",
   },
+  segmentBtn: {
+    flexDirection: "row", alignItems: "center", gap: 6,
+    height: "100%" as any, paddingHorizontal: 14,
+    borderRadius: 7,
+  },
+  segmentBtnActive: { backgroundColor: "#352D27" },
+  segmentBtnText: { fontFamily: "Geist_500Medium", fontSize: 14, fontWeight: "500", color: "#9C8E83" },
+  segmentBtnTextActive: { fontFamily: "Geist_600SemiBold", fontWeight: "600", color: "#FAF5EE" },
+  segmentCount: {
+    fontFamily: "GeistMono_600SemiBold", fontSize: 11.5, fontWeight: "600", color: "#FAF5EE",
+    backgroundColor: "rgba(239,231,218,0.10)", borderRadius: 9999, paddingHorizontal: 6, paddingVertical: 1,
+  },
+  topBarRight: { flexDirection: "row", alignItems: "center", gap: 10 },
+  driversBtn: {
+    flexDirection: "row", alignItems: "center", gap: 8, height: 40,
+    paddingHorizontal: 13, borderRadius: 10, borderWidth: 1,
+    borderColor: "rgba(239,231,218,0.10)", backgroundColor: "rgba(239,231,218,0.04)",
+  },
+  driversBtnLabel: { fontFamily: "Geist_400Regular", fontSize: 13.5, color: "#9C8E83" },
+  driversBtnCountRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  driversBtnDot: { width: 7, height: 7, borderRadius: 3.5 },
+  driversBtnCountText: { fontFamily: "Geist_500Medium", fontSize: 13.5, fontWeight: "500", color: "#FAF5EE" },
+  novoPedidoBtn: {
+    flexDirection: "row", alignItems: "center", gap: 7, height: 40,
+    paddingHorizontal: 16, borderRadius: 10, backgroundColor: "#FF3D14",
+  },
+  novoPedidoBtnText: { fontFamily: "Geist_700Bold", fontSize: 14.5, fontWeight: "700", color: "#fff" },
+  // ── Drivers modal ──
+  driversModalBackdrop: {
+    flex: 1, backgroundColor: "rgba(10,8,6,0.66)",
+    alignItems: "center", justifyContent: "flex-start", paddingTop: 72, paddingHorizontal: 20,
+  },
+  driversModalPanel: {
+    width: "100%", maxWidth: 520, maxHeight: "80%" as any,
+    backgroundColor: "#211C18", borderRadius: 16, borderWidth: 1,
+    borderColor: "rgba(239,231,218,0.09)", overflow: "hidden",
+  },
+  driversModalHeader: {
+    flexDirection: "row", alignItems: "center", gap: 12,
+    padding: 18, paddingBottom: 16,
+    borderBottomWidth: 1, borderBottomColor: "rgba(239,231,218,0.06)",
+  },
+  driversModalIconWrap: {
+    width: 36, height: 36, borderRadius: 10, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,61,20,0.14)",
+  },
+  driversModalTitle: { flex: 1, fontFamily: "Geist_700Bold", fontSize: 18, fontWeight: "700", color: "#FAF5EE" },
+  driversModalCloseBtn: {
+    width: 34, height: 34, borderRadius: 8, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(239,231,218,0.04)", borderWidth: 1, borderColor: "rgba(239,231,218,0.09)",
+  },
+  driversModalList: { flexGrow: 0 },
+  driversModalFeedback: { fontFamily: "Geist_400Regular", fontSize: 13.5, color: "#9C8E83", textAlign: "center", paddingVertical: 34, paddingHorizontal: 20 },
+  driversModalFeedbackError: { fontFamily: "Geist_500Medium", fontSize: 13, color: "#FF7A5C", textAlign: "center", paddingVertical: 34, paddingHorizontal: 20 },
+  driversModalRow: {
+    flexDirection: "row", alignItems: "center", gap: 13,
+    paddingHorizontal: 20, paddingVertical: 13,
+  },
+  driversModalRowBorder: { borderTopWidth: 1, borderTopColor: "rgba(239,231,218,0.055)" },
+  driversModalAvatar: {
+    width: 40, height: 40, borderRadius: 20, flexShrink: 0,
+    backgroundColor: "#C72A0A",
+    alignItems: "center", justifyContent: "center",
+  },
+  driversModalAvatarInactive: { backgroundColor: "rgba(239,231,218,0.07)" },
+  driversModalAvatarText: { fontFamily: "Geist_700Bold", fontSize: 14, fontWeight: "700", color: "#fff" },
+  driversModalName: { fontFamily: "Geist_600SemiBold", fontSize: 14.5, fontWeight: "600", color: "#FAF5EE" },
+  driversModalPriority: { fontFamily: "GeistMono_400Regular", fontSize: 11.5, color: "#6C6259" },
+  driversModalBadge: {
+    flexDirection: "row", alignItems: "center", gap: 6,
+    paddingHorizontal: 10, paddingVertical: 4, borderRadius: 9999,
+  },
+  driversModalBadgeDot: { width: 6, height: 6, borderRadius: 3 },
+  driversModalBadgeText: { fontFamily: "Geist_600SemiBold", fontSize: 12, fontWeight: "600" },
+  driversModalToggleWrap: { flexDirection: "column", alignItems: "center", gap: 3, width: 50 },
+  driversModalToggle: {
+    width: 42, height: 24, borderRadius: 12, padding: 3, flexShrink: 0,
+    backgroundColor: "rgba(239,231,218,0.16)",
+    flexDirection: "row", alignItems: "center", justifyContent: "flex-start",
+  },
+  driversModalToggleOn: { backgroundColor: "#FF3D14", justifyContent: "flex-end" },
+  driversModalToggleLocked: { opacity: 0.55 },
+  driversModalToggleThumb: { width: 18, height: 18, borderRadius: 9, backgroundColor: "#fff" },
+  driversModalToggleThumbOn: {},
+  driversModalToggleLockLabel: { fontFamily: "Geist_400Regular", fontSize: 9.5, color: "#6C6259" },
+  healthPillsRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  healthPill: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+    paddingHorizontal: 11, paddingVertical: 5, borderRadius: 8,
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    backgroundColor: "rgba(250,245,238,0.05)",
+  },
+  healthPillGood: { backgroundColor: "rgba(52,211,154,0.10)", borderColor: "transparent" },
+  healthPillWarn: { backgroundColor: "rgba(242,179,56,0.10)", borderColor: "transparent" },
+  healthPillLate: { backgroundColor: "rgba(255,61,20,0.10)", borderColor: "transparent" },
+  healthPillValue: { fontFamily: "GeistMono_700Bold", fontSize: 16, lineHeight: 16, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.5 },
+  healthPillValueGood: { color: "#34d39a" },
+  healthPillValueWarn: { color: "#f2b338" },
+  healthPillValueLate: { color: "#ff3d14" },
+  healthPillLabel: { fontFamily: "Geist_500Medium", fontSize: 11, lineHeight: 11, color: "rgba(250,245,238,0.65)", fontWeight: "500" },
   dispatchTabs: {
-    // flex: 1,
-    flexDirection: "row",
-    backgroundColor: "#f5f6f7",
-    borderRadius: 12,
-    padding: 6,
-    gap: 6,
+    flexDirection: "row", backgroundColor: "#241d18",
+    borderRadius: 10, padding: 3, gap: 3,
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.08)",
   },
   dispatchTab: {
-    // flex: 1,
-    paddingInline: 20,
-    height: 42,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
+    paddingHorizontal: 14, height: 32, borderRadius: 8,
+    alignItems: "center", justifyContent: "center",
   },
-  dispatchTabActive: {
-    backgroundColor: "#ffffff",
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-  },
-  dispatchTabText: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: "#666666",
-  },
-  dispatchTabTextActive: {
-    color: "#2d2d2d",
-  },
+  dispatchTabActive: { backgroundColor: "#faf5ee" },
+  dispatchTabText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "rgba(250,245,238,0.65)" },
+  dispatchTabTextActive: { color: "#0e0b09" },
   createOrderButton: {
-    height: 42,
-    borderRadius: 10,
-    backgroundColor: "#3f67da",
-    paddingHorizontal: 14,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 8,
+    height: 38, borderRadius: 10, backgroundColor: "#ff3d14",
+    paddingHorizontal: 13, flexDirection: "row", alignItems: "center",
+    justifyContent: "center", gap: 7,
   },
-  createOrderButtonText: {
-    fontSize: 15,
-    fontWeight: "700",
-    color: "#ffffff",
-  },
-  driversMenuContainer: {
-    position: "relative",
-  },
+  createOrderButtonText: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#ffffff" },
+  driversMenuContainer: { position: "relative" },
   driversButton: {
-    height: 42,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#ffffff",
-    paddingHorizontal: 12,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
+    height: 38, borderRadius: 10, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "transparent",
+    paddingHorizontal: 11, flexDirection: "row", alignItems: "center", gap: 7,
   },
-  driversButtonText: {
-    fontSize: 15,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
+  driversButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#faf5ee" },
   driversDropdown: {
-    position: "absolute",
-    right: 0,
-    top: 48,
-    width: 290,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#ffffff",
-    padding: 12,
-    gap: 10,
-    shadowColor: "#000000",
-    shadowOpacity: 0.08,
-    shadowRadius: 12,
-    shadowOffset: { width: 0, height: 8 },
-    elevation: 10,
-    zIndex: 50,
+    position: "absolute", right: 0, top: 46, width: 310,
+    borderRadius: 14, borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+    backgroundColor: "#241d18", padding: 14, gap: 10,
+    shadowColor: "#000", shadowOpacity: 0.5, shadowRadius: 20,
+    shadowOffset: { width: 0, height: 10 }, elevation: 20, zIndex: 50,
   },
-  driversDropdownTitle: {
-    fontSize: 16,
-    fontWeight: "700",
-    color: "#2d2d2d",
-  },
-  driversDropdownList: {
-    gap: 8,
-  },
-  driversDropdownFeedback: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#666666",
-  },
-  driversDropdownError: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#b3261e",
-  },
+  driversDropdownTitle: { fontFamily: "Geist_700Bold", fontSize: 15, lineHeight: 15, fontWeight: "700", color: "#faf5ee" },
+  driversDropdownList: { gap: 8 },
+  driversDropdownFeedback: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "rgba(250,245,238,0.65)" },
+  driversDropdownError: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#ff3d14" },
   driverRow: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#eceff3",
-    backgroundColor: "#f9fafb",
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
+    borderRadius: 11, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    backgroundColor: "rgba(250,245,238,0.03)", padding: 10,
+    flexDirection: "column", gap: 8,
   },
-  driverRowNameWrap: {
-    flex: 1,
+  driverRowInactive: { opacity: 0.55 },
+  driverRowTop: { flexDirection: "row", alignItems: "center", gap: 9 },
+  driverPriorityChip: {
+    width: 22, height: 22, borderRadius: 6,
+    backgroundColor: "rgba(250,245,238,0.07)",
+    alignItems: "center", justifyContent: "center", flexShrink: 0,
   },
-  driverRowActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
+  driverPriorityChipFirst: { backgroundColor: "#ff3d14" },
+  driverPriorityChipText: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.65)" },
+  driverPriorityChipTextFirst: { color: "#ffffff" },
+  driverAvatar: {
+    width: 36, height: 36, borderRadius: 18,
+    backgroundColor: "rgba(250,245,238,0.10)",
+    alignItems: "center", justifyContent: "center", flexShrink: 0,
   },
-  driverPriorityControls: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 6,
+  driverAvatarText: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#faf5ee" },
+  driverRowNameWrap: { flex: 1, gap: 4 },
+  driverRowName: { fontFamily: "Geist_700Bold", fontSize: 14, lineHeight: 14, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.2 },
+  driverStatusRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  driverStatusBadge: {
+    flexDirection: "row", alignItems: "center", gap: 4,
+    paddingHorizontal: 7, paddingVertical: 2, borderRadius: 5,
   },
+  driverLiveDot: { width: 4, height: 4, borderRadius: 2 },
+  driverStatusText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", letterSpacing: 0.5 },
+  driverPriorityControls: { flexDirection: "column", alignItems: "center", gap: 2, flexShrink: 0 },
   driverPriorityButton: {
-    width: 30,
-    height: 30,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#ffffff",
-    alignItems: "center",
-    justifyContent: "center",
+    width: 26, height: 18, borderRadius: 5, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "transparent",
+    alignItems: "center", justifyContent: "center",
   },
-  driverPriorityButtonDisabled: {
-    opacity: 0.4,
-  },
-  driverRowName: {
-    fontSize: 15,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
-  driverRowMeta: {
-    fontSize: 12,
-    color: "#6d7680",
-    marginTop: 2,
-  },
+  driverPriorityButtonDisabled: { opacity: 0.3 },
+  driverRowBottom: { flexDirection: "row", alignItems: "center", gap: 8 },
+  driverRowBottomInfo: { flex: 1, fontFamily: "Geist_400Regular", fontSize: 12, lineHeight: 12, color: "rgba(250,245,238,0.62)" },
   driverToggleButton: {
-    minWidth: 72,
-    borderRadius: 999,
-    borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    alignItems: "center",
-    justifyContent: "center",
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: 6, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "transparent",
+    alignItems: "center", justifyContent: "center",
   },
-  driverToggleButtonActive: {
-    borderColor: "#bde7ca",
-    backgroundColor: "#eaf8ef",
-  },
-  driverToggleButtonInactive: {
-    borderColor: "#d6d9dd",
-    backgroundColor: "#f5f6f7",
-  },
-  driverToggleButtonDisabled: {
-    opacity: 0.6,
-  },
-  driverToggleButtonText: {
-    fontSize: 13,
-    fontWeight: "700",
-  },
-  driverToggleButtonTextActive: {
-    color: "#1d7a43",
-  },
-  driverToggleButtonTextInactive: {
-    color: "#555e68",
-  },
-  topBarContent: {
-    paddingHorizontal: 32,
-  },
-  pageTitle: {
-    fontSize: 24,
-    fontWeight: "700",
-    color: "#2d2d2d",
-  },
-  body: {
-    flex: 1,
-    // paddingHorizontal: 24,
-  },
-  columnsRow: {
-    gap: 28,
-    paddingHorizontal: 28
-  },
+  driverToggleButtonActivate: { backgroundColor: "#ff3d14", borderColor: "transparent" },
+  driverToggleButtonActive: { borderColor: "rgba(52,211,154,0.4)", backgroundColor: "rgba(52,211,154,0.12)" },
+  driverToggleButtonInactive: { borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.04)" },
+  driverToggleButtonDisabled: { opacity: 0.5 },
+  driverToggleButtonText: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.65)", letterSpacing: 0.3 },
+  driverToggleButtonTextActivate: { color: "#ffffff" },
+  driverToggleButtonTextActive: { color: "#34d39a" },
+  driverToggleButtonTextInactive: { color: "rgba(250,245,238,0.65)" },
+  topBarContent: { paddingHorizontal: 18 },
+  pageTitle: { fontFamily: "Geist_700Bold", fontSize: 18, lineHeight: 18, fontWeight: "700", color: "#faf5ee" },
+  body: { flex: 1 },
+  columnsScrollView: { paddingVertical: 0 },
+  columnsRow: { gap: 12, paddingHorizontal: 16, alignItems: "stretch" },
   dispatchColumn: {
-    width: 380,
-    gap: 20,
-    paddingVertical: 14
+    width: 380, gap: 0, paddingVertical: 0,
+    borderRadius: 14, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.10)", backgroundColor: "#181310", overflow: "hidden",
   },
   dispatchSummaryCard: {
-    borderRadius: 12,
-    borderWidth: 1,
-    overflow: 'hidden',
-    borderColor: "#dedede",
-    backgroundColor: "#ffffff",
-
+    backgroundColor: "#181310",
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.10)",
   },
-  dispatchSummaryInner: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12,
-
-  },
-  queueIndexRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
-  },
-  queueIndexLabel: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#4f5b67",
-  },
+  dispatchSummaryInner: { paddingHorizontal: 12, paddingVertical: 10, gap: 10 },
+  queueIndexRow: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8 },
+  queueIndexLabel: { fontFamily: "GeistMono_600SemiBold", fontSize: 10, lineHeight: 10, fontWeight: "600", color: "rgba(250,245,238,0.60)", letterSpacing: 0.5 },
+  queueNumLabel: { fontFamily: "GeistMono_600SemiBold", fontSize: 11, lineHeight: 11, fontWeight: "600", color: "rgba(250,245,238,0.60)", letterSpacing: 0.3 },
   queueActionButton: {
-    minHeight: 30,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#f7f8fa",
-    alignItems: "center",
-    justifyContent: "center",
-    paddingHorizontal: 10,
+    minHeight: 26, borderRadius: 7, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.05)",
+    alignItems: "center", justifyContent: "center", paddingHorizontal: 9,
   },
-  queueActionButtonCancel: {
-    backgroundColor: "#fff4f4",
-    borderColor: "#e3b5b5",
-  },
-  queueActionButtonDisabled: {
-    opacity: 0.4,
-  },
-  queueActionButtonText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#4f5b67",
-  },
-  dispatchHeaderRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 10,
-  },
-  dispatchHeaderBlock: {
-    gap: 10,
-  },
-  dispatchDriverPickerBlock: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    flexShrink: 1,
-  },
+  queueActionButtonCancel: { backgroundColor: "rgba(255,61,20,0.10)", borderColor: "rgba(255,61,20,0.35)" },
+  queueActionButtonDisabled: { opacity: 0.4 },
+  queueActionButtonText: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.6)" },
+  dispatchHeaderRow: { flexDirection: "row", alignItems: "flex-start", gap: 10 },
+  dispatchHeaderBlock: { gap: 9 },
+  dispatchDriverPickerBlock: { flex: 1, flexDirection: "row", alignItems: "center", gap: 8 },
   dispatchDriverPickerButton: {
-    minHeight: 36,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#f7f8fa",
-    paddingHorizontal: 10,
-    paddingVertical: 6,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    maxWidth: 200,
+    flex: 1, minHeight: 34, borderRadius: 9, borderWidth: 1.5,
+    borderStyle: "dashed", borderColor: "rgba(250,245,238,0.20)",
+    backgroundColor: "transparent", paddingHorizontal: 10, paddingVertical: 5,
+    flexDirection: "row", alignItems: "center", gap: 8,
   },
-  dispatchDriverPickerButtonDisabled: {
-    opacity: 0.7,
-  },
-  driverCountBadge: {
-    backgroundColor: "#1685fa",
-    alignItems: "center",
-    justifyContent: "center",
-    width: 28,
-    height: 28,
-    borderRadius: 8,
-  },
+  dispatchDriverPickerButtonDisabled: { opacity: 0.6 },
+  driverCountBadge: { backgroundColor: "#ff3d14", alignItems: "center", justifyContent: "center", width: 26, height: 26, borderRadius: 7 },
   dispatchDriverDropdown: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#ffffff",
-    overflow: "hidden",
+    borderRadius: 9, borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+    backgroundColor: "#241d18", overflow: "hidden",
   },
   dispatchDriverDropdownItem: {
-    minHeight: 40,
-    paddingHorizontal: 10,
-    paddingVertical: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: "#eceff3",
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 8,
+    minHeight: 38, paddingHorizontal: 12, paddingVertical: 8,
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.07)",
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between", gap: 8,
   },
-  dispatchDriverDropdownItemSelected: {
-    backgroundColor: "#eef5ff",
-  },
-  dispatchDriverDropdownItemMain: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    flex: 1,
-  },
-  dispatchDriverDropdownItemText: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
+  dispatchDriverDropdownItemSelected: { backgroundColor: "rgba(255,61,20,0.10)" },
+  dispatchDriverDropdownItemMain: { flexDirection: "row", alignItems: "center", gap: 8, flex: 1 },
+  dispatchDriverDropdownItemText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#faf5ee" },
   dispatchDriverDropdownItemBadge: {
-    fontSize: 11,
-    fontWeight: "700",
-    color: "#555e68",
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    paddingHorizontal: 6,
-    paddingVertical: 2,
-    backgroundColor: "#f5f6f7",
-    overflow: "hidden",
+    fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", color: "rgba(250,245,238,0.60)",
+    borderRadius: 5, borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+    paddingHorizontal: 5, paddingVertical: 2, backgroundColor: "rgba(250,245,238,0.04)", overflow: "hidden",
   },
-  dispatchDriverDropdownItemPriority: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#5a6672",
-  },
+  dispatchDriverDropdownItemPriority: { fontFamily: "GeistMono_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.60)" },
   dispatchTypeBadgesRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    // marginBottom: 6,
-    flexWrap: "wrap",
-    backgroundColor: '#f9f9f9',
-    borderBottomWidth: 1,
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    borderColor: "#dedede",
+    flexDirection: "row", alignItems: "center", gap: 9,
+    backgroundColor: "#241d18", borderBottomWidth: 1, paddingHorizontal: 12,
+    paddingVertical: 10, borderColor: "rgba(250,245,238,0.10)",
   },
-  dispatchTypeBadge: {
-    alignSelf: "flex-start",
-    borderRadius: 999,
-    borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
+  dispatchTypeIcon: {
+    width: 28, height: 28, borderRadius: 7,
+    alignItems: "center", justifyContent: "center",
   },
-  dispatchTypeBadgeDelivery: {
-    borderColor: "#b7d6fb",
-    backgroundColor: "#eaf3ff",
+  dispatchTypeIconDelivery: { backgroundColor: "rgba(255,61,20,0.14)" },
+  dispatchTypeIconTakeaway: { backgroundColor: "rgba(242,179,56,0.14)" },
+  dispatchTypeBadge: { alignSelf: "flex-start", borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2 },
+  dispatchTypeBadgeDelivery: { borderColor: "rgba(255,61,20,0.35)", backgroundColor: "rgba(255,61,20,0.10)" },
+  dispatchTypeBadgeTakeaway: { borderColor: "rgba(242,179,56,0.35)", backgroundColor: "rgba(242,179,56,0.10)" },
+  dispatchTypeBadgeText: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.2, flex: 1 },
+  dispatchTypeBadgeTextDelivery: { color: "#ff8267" },
+  dispatchTypeBadgeTextTakeaway: { color: "#f2b338" },
+  driverName: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "rgba(250,245,238,0.62)", flexShrink: 1 },
+  driverNameEmpty: { color: "rgba(250,245,238,0.68)", fontStyle: "italic" },
+  driverMeta: { fontFamily: "GeistMono_700Bold", fontSize: 12, lineHeight: 12, fontWeight: "700", color: "#fff" },
+  statusBadge: { borderRadius: 6, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2, alignItems: "center", justifyContent: "center" },
+  statusBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700" },
+  statusBadgeWaiting: { backgroundColor: "rgba(250,245,238,0.05)", borderColor: "rgba(250,245,238,0.12)" },
+  statusBadgeOnDelivery: { backgroundColor: "rgba(255,61,20,0.10)", borderColor: "rgba(255,61,20,0.35)" },
+  statusBadgeDelivered: { backgroundColor: "rgba(52,211,154,0.10)", borderColor: "rgba(52,211,154,0.35)" },
+  statusBadgeTextWaiting: { color: "rgba(250,245,238,0.65)" },
+  statusBadgeTextOnDelivery: { color: "#ff8267" },
+  statusBadgeTextDelivered: { color: "#34d39a" },
+  dispatchTypeHeader: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+    padding: 12,
+    backgroundColor: "#241d18",
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.08)",
   },
-  dispatchTypeBadgeTakeaway: {
-    borderColor: "#ffd6a3",
-    backgroundColor: "#fff5e8",
+  dispatchTypeIconWrap: {
+    width: 34, height: 34, borderRadius: 9,
+    alignItems: "center", justifyContent: "center",
   },
-  dispatchTypeBadgeText: {
-    fontSize: 17,
-    fontWeight: "500",
-    color: '#666'
+  dispatchTypeIconWrapDelivery: { backgroundColor: "rgba(255,61,20,0.14)" },
+  dispatchTypeIconWrapTakeaway: { backgroundColor: "rgba(242,179,56,0.14)" },
+  dispatchTypeLabel: { fontFamily: "Geist_700Bold", fontSize: 14, lineHeight: 14, fontWeight: "700", letterSpacing: -0.2, color: "#faf5ee" },
+  dispatchTypeLabelDelivery: {},
+  dispatchTypeLabelTakeaway: {},
+  dispatchTypeFilaLabel: { fontFamily: "Geist_600SemiBold", fontSize: 11, lineHeight: 11, fontWeight: "600", color: "rgba(250,245,238,0.68)", letterSpacing: 0.2 },
+  dispatchNavButton: {
+    width: 28, height: 28, borderRadius: 7, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.10)", backgroundColor: "rgba(250,245,238,0.04)",
+    alignItems: "center", justifyContent: "center",
   },
-  dispatchTypeBadgeTextDelivery: {
-    color: "#1e5da9",
+  dispatchNavButtonDisabled: { opacity: 0.3 },
+  dispatchCardHeader: {
+    flexDirection: "row", alignItems: "center", gap: 12,
+    paddingHorizontal: 14, paddingVertical: 12,
   },
-  dispatchTypeBadgeTextTakeaway: {
-    color: "#555e68",
+  dispatchCardHeaderDispatched: { backgroundColor: "rgba(52,211,154,0.10)" },
+  dispatchCardAvatarWrap: {
+    width: 40, height: 40, borderRadius: 20,
+    backgroundColor: "rgba(250,245,238,0.12)",
+    alignItems: "center", justifyContent: "center", flexShrink: 0,
   },
-  driverName: {
-    fontSize: 16,
-    fontWeight: "600",
-    color: "#2d2d2d",
-    flexShrink: 1,
+  dispatchCardAvatarTakeaway: { backgroundColor: "rgba(242,179,56,0.14)" },
+  dispatchCardAvatarText: { fontFamily: "Geist_700Bold", fontSize: 14, lineHeight: 14, fontWeight: "700", color: "#faf5ee" },
+  dispatchCardDriverName: { fontFamily: "Geist_700Bold", fontSize: 15, lineHeight: 15, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.2 },
+  dispatchCardDriverNameEmpty: { color: "rgba(250,245,238,0.68)", fontStyle: "italic" },
+  dispatchCardStatusRow: { flexDirection: "row", alignItems: "center", gap: 5, marginTop: 4 },
+  dispatchCardDot: { width: 5, height: 5, borderRadius: 3 },
+  dispatchCardStatusText: { fontFamily: "GeistMono_600SemiBold", fontSize: 11, lineHeight: 11, fontWeight: "600", letterSpacing: 1.2 },
+  dispatchQueueBadge: {
+    minWidth: 30, height: 30, borderRadius: 9, backgroundColor: "#ff3d14",
+    alignItems: "center", justifyContent: "center", paddingHorizontal: 6,
   },
-  driverMeta: {
-    fontSize: 16,
-    fontWeight: '600',
-    color: "#fff",
-
+  dispatchQueueBadgeText: { fontFamily: "GeistMono_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#ffffff" },
+  dispatchDurationRow: {
+    flexDirection: "row", gap: 8,
+    paddingHorizontal: 14, paddingBottom: 12,
   },
-  statusBadge: {
-    borderRadius: 8,
-    borderWidth: 1,
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-    // minHeight: 34,
-    alignItems: "center",
-    justifyContent: "center",
+  dispatchDurationBox: {
+    flex: 1, borderRadius: 9, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.10)", backgroundColor: "rgba(250,245,238,0.04)",
+    paddingHorizontal: 11, paddingVertical: 9, gap: 5,
   },
-  statusBadgeText: {
-    fontSize: 15,
-    fontWeight: "700",
+  dispatchDurationBoxRight: {},
+  dispatchDurationLabel: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", color: "rgba(250,245,238,0.4)", letterSpacing: 0.5 },
+  dispatchDurationValue: { fontFamily: "GeistMono_700Bold", fontSize: 15, lineHeight: 15, fontWeight: "700", color: "#faf5ee" },
+  dispatchActionsRow: {
+    flexDirection: "row", gap: 8,
+    paddingHorizontal: 14, paddingBottom: 14,
   },
-  statusBadgeWaiting: {
-    backgroundColor: "#f5f6f7",
-    borderColor: "#d6d9dd",
+  dispatchPrimaryButton: {
+    flex: 1, height: 46, borderRadius: 11, backgroundColor: "#ff3d14",
+    alignItems: "center", justifyContent: "center",
   },
-  statusBadgeOnDelivery: {
-    backgroundColor: "#fff5e8",
-    borderColor: "#ffd6a3",
+  dispatchPrimaryButtonDisabled: { opacity: 0.4 },
+  dispatchPrimaryButtonText: { fontFamily: "Geist_700Bold", fontSize: 15, lineHeight: 15, fontWeight: "700", color: "#ffffff" },
+  dispatchMapButton: {
+    flex: 1, height: 42, borderRadius: 10, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.05)",
+    flexDirection: "row", alignItems: "center", justifyContent: "center",
+    paddingHorizontal: 12, gap: 6,
   },
-  statusBadgeDelivered: {
-    backgroundColor: "#eaf8ef",
-    borderColor: "#bde7ca",
+  dispatchMapButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "rgba(250,245,238,0.7)" },
+  dispatchMarkDeliveredButton: {
+    flex: 1, height: 42, borderRadius: 10, backgroundColor: "#34d39a",
+    flexDirection: "row", alignItems: "center", justifyContent: "center",
+    gap: 6,
   },
-  statusBadgeTextWaiting: {
-    color: "#555e68",
+  dispatchMarkDeliveredButtonText: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#0e0b09" },
+  dispatchMapIconButton: {
+    width: 42, height: 42, borderRadius: 10, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.05)",
+    alignItems: "center", justifyContent: "center",
   },
-  statusBadgeTextOnDelivery: {
-    color: "#c76b00",
+  dispatchReorderRow: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    paddingHorizontal: 14, paddingVertical: 8,
+    borderTopWidth: 1, borderTopColor: "rgba(250,245,238,0.07)",
   },
-  statusBadgeTextDelivered: {
-    color: "#1d7a43",
-  },
-  summaryButtonsRow: {
-    flexDirection: "row",
-    gap: 12,
-  },
+  dispatchReorderQueueLabel: { fontFamily: "GeistMono_600SemiBold", fontSize: 10, lineHeight: 10, fontWeight: "600", color: "rgba(250,245,238,0.68)", letterSpacing: 0.5 },
+  summaryButtonsRow: { flexDirection: "row", gap: 8 },
   primaryButton: {
-    flex: 1,
-    // height: 54,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: "#1685fa",
-    alignItems: "center",
-    justifyContent: "center",
+    flex: 1, paddingVertical: 10, borderRadius: 9, backgroundColor: "#ff3d14",
+    alignItems: "center", justifyContent: "center",
   },
-  primaryButtonDisabled: {
-    opacity: 0.45,
-  },
-  primaryButtonText: {
-    fontSize: 17,
-    fontWeight: "600",
-    color: "#ffffff",
-  },
+  primaryButtonDisabled: { opacity: 0.4 },
+  primaryButtonText: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#ffffff" },
   secondaryButton: {
-    flex: 1,
-    // height: 54,
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: "#f0f0f0",
-    alignItems: "center",
-    justifyContent: "center",
+    flex: 1, paddingVertical: 10, borderRadius: 9, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "transparent",
+    alignItems: "center", justifyContent: "center",
   },
-  secondaryButtonText: {
-    fontSize: 17,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
-  ordersColumn: {
-    gap: 18,
-  },
-  orderCardWithSlot: {
-    gap: 18,
-  },
+  secondaryButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#faf5ee" },
+  ordersColumn: { gap: 8, padding: 10 },
+  orderCardWithSlot: { gap: 8 },
   dispatchInsertSlot: {
-    width: "100%",
-    height: 64,
-    borderRadius: 14,
-    borderWidth: 2,
-    borderStyle: "dashed",
-    borderColor: "#dedede",
-    backgroundColor: "#ffffff",
-    alignItems: "center",
-    justifyContent: "center",
+    width: "100%", height: 36, alignItems: "center", justifyContent: "center",
+    borderRadius: 8, borderWidth: 1, borderColor: "rgba(255,61,20,0.35)",
+    backgroundColor: "rgba(255,61,20,0.08)",
   },
-  dispatchInsertSlotDisabled: {
-    opacity: 0.6,
-  },
-  insertSlotPlaceholder: {
-    width: "100%",
-    height: 0,
-  },
+  dispatchInsertSlotDisabled: { opacity: 0.5 },
+  insertSlotPlaceholder: { width: "100%", height: 0 },
   orderCard: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#dedede",
-    backgroundColor: "#ffffff",
-    overflow: "hidden",
+    borderRadius: 11, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    backgroundColor: "rgba(250,245,238,0.04)", overflow: "hidden",
   },
-  orderCardDimmed: {
+  orderCardDimmed: { opacity: 0.38 },
+  orderCardTop: { paddingHorizontal: 12, paddingVertical: 10, gap: 7 },
+  orderBadgesRow: { flexDirection: "row", alignItems: "center", gap: 6, marginBottom: 2 },
+  orderTypeBadge: { borderRadius: 5, borderWidth: 1, paddingHorizontal: 6, paddingVertical: 2 },
+  orderTypeBadgeTakeaway: { borderColor: "rgba(242,179,56,0.35)", backgroundColor: "rgba(242,179,56,0.10)" },
+  orderTypeBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", letterSpacing: 0.5, textTransform: "uppercase" },
+  orderTypeBadgeTextTakeaway: { color: "#f2b338" },
+  orderHeaderRow: { flexDirection: "row", alignItems: "flex-start", justifyContent: "space-between", gap: 10 },
+  deliveredBadge: { backgroundColor: "rgba(52,211,154,0.12)", borderColor: "rgba(52,211,154,0.35)", borderWidth: 1, borderRadius: 6, paddingHorizontal: 6, paddingVertical: 2 },
+  deliveredBadgeText: { color: "#34d39a", fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700" },
+  departureBadge: { borderRadius: 6, borderWidth: 1, borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.05)", paddingHorizontal: 7, paddingVertical: 3 },
+  departureBadgeLate: { borderColor: "rgba(255,61,20,0.4)", backgroundColor: "rgba(255,61,20,0.12)" },
+  departureBadgeText: { color: "rgba(250,245,238,0.7)", fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", fontVariant: ["tabular-nums"] },
+  departureBadgeTextLate: { color: "#ff8267" },
+  orderSmallText: { fontFamily: "Geist_500Medium", fontSize: 11, lineHeight: 11, fontWeight: "500", color: "rgba(250,245,238,0.60)" },
+  orderCustomerName: { fontFamily: "Geist_700Bold", fontSize: 14, lineHeight: 14, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.2 },
+  orderHeaderCustomerBlock: { flex: 1, gap: 4 },
+  orderCustomerPhone: { fontFamily: "Geist_500Medium", fontSize: 11, lineHeight: 11, fontWeight: "500", color: "rgba(250,245,238,0.65)" },
+  orderCustomerContactRow: { flexDirection: "row", alignItems: "center", gap: 8, flexWrap: "wrap" },
+  orderWhatsAppButton: {
+    flexDirection: "row", alignItems: "center", gap: 4, borderRadius: 5,
+    borderWidth: 1, borderColor: "rgba(52,211,154,0.35)",
+    backgroundColor: "rgba(52,211,154,0.10)", paddingHorizontal: 7, paddingVertical: 3,
+  },
+  orderWhatsAppButtonText: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "#34d39a" },
+  orderAddressRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 2 },
+  orderAddressText: { flex: 1, fontFamily: "Geist_500Medium", fontSize: 12, lineHeight: 12, color: "rgba(250,245,238,0.6)", fontWeight: "500" },
+  orderEtaBadge: {
+    borderRadius: 6, borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+    backgroundColor: "rgba(250,245,238,0.05)", paddingHorizontal: 7, paddingVertical: 3,
+  },
+  orderEtaText: { fontFamily: "GeistMono_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.7)" },
+  dispatchDurationInfoContainer: { borderRadius: 8, flexDirection: "column", gap: 0 },
+  dispatchDurationInfoRow: {
+    flexDirection: "row", alignItems: "center", justifyContent: "space-between",
+    gap: 3, borderWidth: 1, paddingVertical: 4, paddingHorizontal: 8, borderRadius: 7,
+    backgroundColor: "rgba(250,245,238,0.04)", borderColor: "rgba(250,245,238,0.10)",
+  },
+  dispatchDurationInfoLabel: { fontFamily: "Geist_500Medium", fontSize: 11, lineHeight: 11, color: "rgba(250,245,238,0.60)", fontWeight: "500" },
+  dispatchDurationInfoValue: { fontFamily: "GeistMono_700Bold", fontSize: 12, lineHeight: 12, color: "#faf5ee", fontWeight: "700" },
+  noteContainer: { marginTop: 4, borderRadius: 7, borderWidth: 1, borderColor: "rgba(242,179,56,0.30)", backgroundColor: "rgba(242,179,56,0.08)" },
+  noteInner: { minHeight: 32, flexDirection: "row", alignItems: "center", gap: 7, paddingHorizontal: 10, paddingVertical: 5 },
+  noteText: { fontFamily: "Geist_400Regular", fontSize: 12, lineHeight: 12, color: "#f2b338", flexShrink: 1 },
+  orderActionButton: {
+    height: 38, borderRadius: 9, backgroundColor: "rgba(250,245,238,0.06)",
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.12)", alignItems: "center", justifyContent: "center",
+  },
+  showMoreSection: { paddingVertical: 9, paddingHorizontal: 12, borderTopWidth: 1, borderTopColor: "rgba(250,245,238,0.07)" },
+  showMoreSectionWithDivider: { borderTopWidth: 1, borderTopColor: "rgba(250,245,238,0.10)" },
+  showMoreButton: {
+    paddingVertical: 9, borderRadius: 9, backgroundColor: "rgba(250,245,238,0.05)",
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", alignItems: "center", justifyContent: "center",
+  },
+  showMoreButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 12, lineHeight: 12, fontWeight: "600", color: "rgba(250,245,238,0.68)" },
+  orderFooterButtonsRow: { flexDirection: "row", gap: 8 },
+  orderFooterButton: { flex: 1 },
+  orderActionButtonDisabled: { opacity: 0.45 },
+  orderActionButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 12, lineHeight: 12, fontWeight: "600", color: "rgba(250,245,238,0.7)" },
+  orderItemsContainer: { paddingVertical: 10, paddingHorizontal: 12, gap: 6 },
+  orderItemBlock: { width: "100%" },
+  orderItemRow: {
+    borderRadius: 9, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    paddingHorizontal: 12, paddingVertical: 9, flexDirection: "row",
+    alignItems: "center", justifyContent: "space-between", gap: 10,
+  },
+  orderItemRowWithTasks: { borderBottomLeftRadius: 4, borderBottomRightRadius: 0 },
+  orderItemContent: { flex: 1, flexDirection: "row", alignItems: "center" },
+  orderItemText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#faf5ee", flex: 1 },
+  orderTaskRow: {
+    borderLeftWidth: 1, borderRightWidth: 1, borderBottomWidth: 1,
+    borderColor: "rgba(250,245,238,0.10)", paddingHorizontal: 12, paddingVertical: 8, justifyContent: "center",
+  },
+  orderTaskRowStep: { marginLeft: 12 },
+  orderTaskRowModifier: { marginLeft: 24 },
+  orderTaskRowWithChildren: { borderBottomLeftRadius: 4, borderBottomRightRadius: 0 },
+  orderTaskRowLast: { borderBottomLeftRadius: 8, borderBottomRightRadius: 8 },
+  orderTaskRowText: { fontFamily: "Geist_600SemiBold", fontSize: 13, lineHeight: 13, fontWeight: "600", color: "#faf5ee", flex: 1 },
+  orderTaskRowInner: { flexDirection: "row", alignItems: "center", gap: 8 },
+  orderTaskCompletedBadge: { borderRadius: 5, borderWidth: 1, borderColor: "rgba(52,211,154,0.35)", backgroundColor: "rgba(52,211,154,0.10)", paddingHorizontal: 5, paddingVertical: 2 },
+  orderTaskCompletedBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", color: "#34d39a" },
+  prizeBadge: { borderRadius: 5, borderWidth: 1, borderColor: "rgba(250,245,238,0.20)", backgroundColor: "rgba(250,245,238,0.07)", paddingHorizontal: 5, paddingVertical: 2 },
+  prizeBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", color: "rgba(250,245,238,0.7)" },
+  rewardBadge: { borderRadius: 5, borderWidth: 1, borderColor: "rgba(52,211,154,0.30)", backgroundColor: "rgba(52,211,154,0.08)", paddingHorizontal: 5, paddingVertical: 2 },
+  rewardBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", color: "#34d39a" },
+  orderItemStatus: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "#f2b338" },
+  orderItemDeliveredStatus: { color: "#34d39a" },
+  feedbackText: { fontFamily: "Geist_600SemiBold", fontSize: 14, lineHeight: 14, fontWeight: "600", color: "rgba(250,245,238,0.60)", padding: 24 },
+  loadingState: { flex: 1, alignItems: "center", justifyContent: "center" },
+  loadingText: { fontFamily: "GeistMono_400Regular", fontSize: 13, color: "rgba(250,245,238,0.40)", letterSpacing: 0.4 },
+  errorToast: {
+    position: "absolute",
+    maxWidth: 360,
+    minWidth: 220,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: "rgba(255,61,20,0.28)",
+    backgroundColor: "#24110d",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.28,
+    shadowRadius: 24,
+    elevation: 12,
+    zIndex: 80,
+  },
+  errorToastText: {
+    flex: 1,
+    fontFamily: "Geist_600SemiBold",
+    fontSize: 13,
+    lineHeight: 17,
+    fontWeight: "600",
+    color: "#ffd8cf",
+  },
+  mapDrawerLayer: { ...StyleSheet.absoluteFillObject, zIndex: 40, flexDirection: "row", justifyContent: "flex-end" },
+  mapDrawerBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.55)" },
+  mapDrawer: {
+    width: "100%", height: "100%", backgroundColor: "#181310", flexDirection: "column",
+    borderLeftWidth: 1, borderLeftColor: "rgba(250,245,238,0.10)", padding: 16, gap: 12,
+  },
+  mapDrawerHeader: { flexDirection: "row", alignItems: "center", justifyContent: "space-between" },
+  mapDrawerTitle: { fontFamily: "Geist_700Bold", fontSize: 18, lineHeight: 18, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.3 },
+  mapDrawerSubtitle: { fontFamily: "Geist_400Regular", fontSize: 12, lineHeight: 12, color: "rgba(250,245,238,0.65)", marginTop: 4 },
+  mapDrawerCloseButton: {
+    height: 34, width: 34, borderRadius: 9, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(250,245,238,0.07)", borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+  },
+  routeMapInteractive: { flex: 2, minWidth: 0, minHeight: 420, borderRadius: 10, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", backgroundColor: "#0e0b09" },
+  routeMapFallbackCard: { flex: 1, minHeight: 200 },
+  routeContentRow: { flexDirection: "column", flex: 1, gap: 10 },
+  routeMapFullHeight: { flex: 1, minHeight: 200, borderRadius: 10, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", backgroundColor: "#16120F", overflow: "hidden" },
+  routePointsStrip: { borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", borderRadius: 10, backgroundColor: "#0e0b09", padding: 8, gap: 6 },
+  routePointsHScroll: { flexShrink: 0 },
+  routePointsHBlock: { flexDirection: "row", gap: 8, alignItems: "flex-start" },
+  routePointCard: {
+    width: 160, flexDirection: "column", gap: 6, borderRadius: 9,
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", padding: 8,
+    backgroundColor: "rgba(250,245,238,0.03)",
+  },
+  routePointsPanel: { width: 340, maxHeight: 420, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", borderRadius: 10, backgroundColor: "#0e0b09", padding: 8, gap: 8 },
+  routePointsScroll: { flex: 1 },
+  mapFallbackCard: { borderRadius: 10, borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", backgroundColor: "rgba(250,245,238,0.03)", padding: 12 },
+  mapFallbackText: { fontFamily: "Geist_500Medium", fontSize: 13, lineHeight: 13, color: "rgba(250,245,238,0.60)", fontWeight: "500" },
+  routePointsBlock: { gap: 6 },
+  routeLoadingText: { fontFamily: "Geist_600SemiBold", fontSize: 11, lineHeight: 11, color: "rgba(250,245,238,0.60)", fontWeight: "600", marginBottom: 2 },
+  routePointRow: {
+    flexDirection: "row", gap: 10, alignItems: "flex-start", borderRadius: 9,
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.10)", paddingVertical: 8,
+    paddingHorizontal: 10, backgroundColor: "rgba(250,245,238,0.03)",
+  },
+  routePointIndex: { width: 20, height: 20, borderRadius: 10, backgroundColor: "#ff3d14", alignItems: "center", justifyContent: "center" },
+  routePointIndexText: { fontFamily: "GeistMono_700Bold", fontSize: 10, lineHeight: 10, color: "#ffffff", fontWeight: "700" },
+  routePointTextBlock: { flex: 1, gap: 3 },
+  routePointLabel: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 13, fontWeight: "700", color: "#faf5ee" },
+  routePointAddress: { fontFamily: "Geist_400Regular", fontSize: 11, lineHeight: 11, color: "rgba(250,245,238,0.65)" },
+  routePointMapsButton: {
+    minHeight: 28, borderRadius: 7, borderWidth: 1, borderColor: "rgba(250,245,238,0.15)",
+    backgroundColor: "rgba(250,245,238,0.05)", paddingHorizontal: 8,
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 4,
+  },
+  routePointMapsButtonText: { fontFamily: "Geist_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "rgba(250,245,238,0.7)" },
+  dispatchDropCard: { width: "100%", height: 60, borderRadius: 12, borderWidth: 1.5, borderStyle: "dashed", alignItems: "center", justifyContent: "center" },
+  dispatchDropCardActive: { borderColor: "rgba(255,61,20,0.4)", backgroundColor: "rgba(255,61,20,0.07)", opacity: 1 },
+  dispatchDropCardInactive: { borderColor: "rgba(250,245,238,0.12)", backgroundColor: "transparent", opacity: 0.6 },
+
+  // Order card — redesigned
+  orderTicketRow: { flexDirection: "row", alignItems: "center", gap: 7, marginBottom: 6 },
+  orderTicketBadge: {
+    paddingHorizontal: 6, paddingVertical: 2, borderRadius: 5,
+    backgroundColor: "rgba(250,245,238,0.09)", borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+  },
+  orderTicketText: { fontFamily: "GeistMono_700Bold", fontSize: 11, lineHeight: 11, fontWeight: "700", color: "#faf5ee", letterSpacing: 0.2 },
+  orderCustomerNameStandalone: { fontFamily: "Geist_700Bold", fontSize: 16, lineHeight: 16, fontWeight: "700", color: "#faf5ee", letterSpacing: -0.3, marginBottom: 6 },
+  orderAddressDot: { width: 6, height: 6, borderRadius: 3, backgroundColor: "rgba(250,245,238,0.3)", flexShrink: 0 },
+  orderItemsInlineText: { fontSize: 12, lineHeight: 17, color: "rgba(250,245,238,0.62)", fontWeight: "500", marginTop: 5, fontFamily: "GeistMono_400Regular", letterSpacing: 0.22 },
+  orderCardFooter: {
+    flexDirection: "column", gap: 6,
+    paddingHorizontal: 12, paddingBottom: 10, paddingTop: 4,
+  },
+  orderMoveButton: {
+    flex: 1, height: 36, borderRadius: 8, borderWidth: 1,
+    borderColor: "rgba(250,245,238,0.12)", backgroundColor: "rgba(250,245,238,0.05)",
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6,
+  },
+  orderMoveButtonText: { fontFamily: "Geist_600SemiBold", fontSize: 12, lineHeight: 12, fontWeight: "600", color: "rgba(250,245,238,0.6)" },
+  orderMoveButtonCancel: { borderColor: "rgba(255,61,20,0.25)", backgroundColor: "rgba(255,61,20,0.08)" },
+  orderMoveButtonTextCancel: { color: "#ff3d14" },
+  orderMoveButtonDisabled: { opacity: 0.35 },
+  orderDepartureTime: { fontFamily: "GeistMono_700Bold", fontSize: 14, lineHeight: 14, fontWeight: "700", color: "#f2b338", letterSpacing: -0.3 },
+  orderDepartureTimeLate: { color: "#ff3d14" },
+  orderTimerPill: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    backgroundColor: "rgba(255,61,20,0.10)",
+    paddingHorizontal: 8, paddingVertical: 4, borderRadius: 999,
+  },
+  orderTimerDot: { width: 6, height: 6, borderRadius: 999 },
+  orderTimerText: { fontFamily: "GeistMono_700Bold", fontSize: 12, lineHeight: 12, fontWeight: "700", color: "#f2b338", letterSpacing: 0.4 },
+  orderTimerTextLate: { color: "#ff3d14" },
+
+  // ── Direction B: Urgency chip ─────────────────────────────────────────────
+  urgencyChip: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    borderRadius: 9999, paddingVertical: 4, paddingHorizontal: 9,
+  },
+  urgencyChipText: { fontFamily: "Geist_600SemiBold", fontSize: 12, lineHeight: 14, fontWeight: "600" },
+  sourceBadge: {
+    flexDirection: "row", alignItems: "center", gap: 4,
+    borderRadius: 6, paddingVertical: 3, paddingHorizontal: 7,
+  },
+  sourceBadgeText: { fontFamily: "Geist_700Bold", fontSize: 10, lineHeight: 10, fontWeight: "700", letterSpacing: 0.2 },
+
+  // ── Direction B: Status strip ─────────────────────────────────────────────
+  statusStrip: {
+    flexDirection: "row", alignItems: "center", gap: 10,
+    padding: 10, borderRadius: 10, borderLeftWidth: 3,
+  },
+  statusStripTitle: { fontFamily: "Geist_700Bold", fontSize: 13, lineHeight: 16, fontWeight: "700" },
+  statusStripNote: { fontFamily: "Geist_400Regular", fontSize: 11, color: "#C8BCB0", marginTop: 2 },
+  statusStripReturn: { fontFamily: "GeistMono_500Medium", fontSize: 12 },
+
+  // ── Direction B: Card header ──────────────────────────────────────────────
+  dispatchCardHeader2: {
+    flexDirection: "row", alignItems: "center", gap: 11,
+    padding: 14, borderBottomWidth: 1, borderBottomColor: "rgba(239,231,218,0.055)",
+  },
+  dispatchCardHeader2Title: {
+    fontFamily: "Geist_700Bold", fontSize: 18, lineHeight: 20, fontWeight: "700",
+    color: "#FAF5EE", letterSpacing: -0.3,
+  },
+  dispatchCardHeader2Sub: {
+    fontFamily: "Geist_400Regular", fontSize: 12, color: "#9C8E83", marginTop: 3,
+  },
+
+  // ── Direction B: Dispatch level container ────────────────────────────────
+  dispatchLevel: {
+    padding: 14, gap: 12,
+    borderBottomWidth: 1, borderBottomColor: "rgba(239,231,218,0.055)",
+  },
+
+  // ── Direction B: Driver row ───────────────────────────────────────────────
+  driverRow2: {
+    flexDirection: "row", alignItems: "center", gap: 11,
+    padding: 10, borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.025)",
+    borderWidth: 1, borderColor: "rgba(239,231,218,0.055)",
+  },
+  driverRow2Avatar: {
+    width: 40, height: 40, borderRadius: 20, flexShrink: 0,
+    backgroundColor: "rgba(239,231,218,0.07)",
+    borderWidth: 1.5, borderStyle: "dashed", borderColor: "rgba(239,231,218,0.2)",
+    alignItems: "center", justifyContent: "center",
+  },
+  driverRow2AvatarFilled: {
+    backgroundColor: "#C72A0A", borderWidth: 0, borderStyle: "solid",
+  },
+  driverRow2AvatarText: {
+    fontFamily: "Geist_700Bold", fontSize: 14, fontWeight: "700", color: "#fff",
+  },
+  driverRow2Name: {
+    fontFamily: "Geist_600SemiBold", fontSize: 15, fontWeight: "600", color: "#FAF5EE", lineHeight: 18,
+  },
+  driverRow2NameEmpty: { color: "#9C8E83" },
+  driverRow2Sub: { fontFamily: "Geist_400Regular", fontSize: 12, color: "#9C8E83", marginTop: 2 },
+  driverRow2ActionBtn: {
+    flexDirection: "row", alignItems: "center", gap: 6,
+    paddingVertical: 7, paddingHorizontal: 12, borderRadius: 8, borderWidth: 1,
+  },
+  driverRow2ActionBtnPrimary: {
+    backgroundColor: "rgba(255,61,20,0.14)", borderColor: "rgba(255,61,20,0.3)",
+  },
+  driverRow2ActionBtnSecondary: {
+    backgroundColor: "rgba(255,255,255,0.04)", borderColor: "rgba(239,231,218,0.09)",
+  },
+  driverRow2ActionText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 12.5, fontWeight: "600", color: "#FF3D14",
+  },
+  driverRow2ActionTextSecondary: { color: "#C8BCB0" },
+
+  // ── Direction B: ETA boxes ────────────────────────────────────────────────
+  etaBox: {
+    flex: 1, backgroundColor: "rgba(255,255,255,0.025)",
+    borderWidth: 1, borderColor: "rgba(239,231,218,0.055)",
+    borderRadius: 10, padding: 11,
+  },
+  etaBoxLabel: {
+    fontFamily: "Geist_600SemiBold", fontSize: 10, fontWeight: "600",
+    letterSpacing: 0.8, color: "#6C6259", marginBottom: 8,
+  },
+  etaBoxTrack: { flexDirection: "row", alignItems: "center", gap: 5, marginBottom: 8 },
+  etaBoxOriginDot: {
+    width: 9, height: 9, borderRadius: 5,
+    backgroundColor: "#352D27", borderWidth: 2, borderColor: "#6C6259",
+  },
+  etaBoxLine: { flex: 1, height: 0, borderBottomWidth: 2, borderStyle: "dashed" },
+  etaBoxValue: {
+    fontFamily: "Geist_600SemiBold", fontSize: 18, fontWeight: "600",
+    color: "#FAF5EE", lineHeight: 20,
+  },
+
+  // ── Direction B: Action buttons ───────────────────────────────────────────
+  dispatchBtn2Primary: {
+    flex: 1, flexDirection: "row", alignItems: "center", justifyContent: "center",
+    gap: 8, paddingVertical: 13, borderRadius: 10,
+    backgroundColor: "#FF3D14",
+  },
+  dispatchBtn2PrimaryDisabled: { backgroundColor: "rgba(255,61,20,0.22)" },
+  dispatchBtn2PrimaryText: {
+    fontFamily: "Geist_700Bold", fontSize: 16, fontWeight: "700", color: "#ffffff",
+  },
+  dispatchBtn2PrimaryTextDisabled: { color: "rgba(250,245,238,0.45)" },
+  dispatchBtn2Secondary: {
+    flexDirection: "row", alignItems: "center", gap: 7,
+    paddingVertical: 0, paddingHorizontal: 16, borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderWidth: 1, borderColor: "rgba(239,231,218,0.09)",
+  },
+  dispatchBtn2SecondaryText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 13.5, fontWeight: "600", color: "#FAF5EE",
+  },
+  dispatchBtn2Route: {
+    width: "100%" as any, flexDirection: "row", alignItems: "center", justifyContent: "center",
+    gap: 8, paddingVertical: 12, borderRadius: 10,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    borderWidth: 1, borderColor: "rgba(239,231,218,0.09)",
+  },
+  dispatchBtn2RouteText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 14, fontWeight: "600", color: "#FAF5EE",
+  },
+
+  // ── Direction B: Order card ───────────────────────────────────────────────
+  orderCard2: {
+    flexDirection: "row", overflow: "hidden",
+    backgroundColor: "#2A231E",
+    borderWidth: 1, borderColor: "rgba(239,231,218,0.09)", borderRadius: 10,
+  },
+  orderCard2Rail: { width: 4, flexShrink: 0 },
+  orderCard2Body: { padding: 12, gap: 8 },
+  orderCard2Id: {
+    fontFamily: "GeistMono_500Medium", fontSize: 11.5, fontWeight: "500", color: "#6C6259",
+  },
+  orderCard2Name: {
+    fontFamily: "Geist_700Bold", fontSize: 18, fontWeight: "700", color: "#FAF5EE", letterSpacing: -0.3,
+  },
+  orderCard2Address: {
+    flex: 1, fontFamily: "Geist_400Regular", fontSize: 13, color: "#FAF5EE", lineHeight: 18,
+  },
+  orderCard2ComplLabel: {
+    fontFamily: "Geist_600SemiBold", fontSize: 12, fontWeight: "600", color: "#FF3D14",
+  },
+  orderCard2Compl: {
+    fontFamily: "Geist_400Regular", fontSize: 12, color: "#C8BCB0", flex: 1,
+  },
+  orderCard2Item: {
+    fontFamily: "GeistMono_400Regular", fontSize: 12, color: "#C8BCB0",
+  },
+  orderCard2ItemMore: {
+    fontFamily: "Geist_400Regular", fontSize: 11.5, color: "#6C6259",
+  },
+  orderCard2Footer: {
+    gap: 7, paddingHorizontal: 12, paddingBottom: 12,
+  },
+  orderCard2BtnSuccess: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7,
+    paddingVertical: 8, borderRadius: 8,
+    backgroundColor: "rgba(0,168,102,0.14)", borderWidth: 1, borderColor: "rgba(0,168,102,0.28)",
+  },
+  orderCard2BtnSuccessText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 12.5, fontWeight: "600", color: "#34D98A",
+  },
+  orderCard2BtnGhost: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 6,
+    paddingVertical: 7, paddingHorizontal: 12, borderRadius: 8,
+    backgroundColor: "rgba(255,255,255,0.04)", borderWidth: 1, borderColor: "rgba(239,231,218,0.09)",
+  },
+  orderCard2BtnGhostText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 12.5, fontWeight: "600", color: "#C8BCB0",
+  },
+  // ── Empty state ──
+  emptyState: {
+    flex: 1, alignItems: "center", justifyContent: "center",
+    paddingHorizontal: 24, paddingVertical: 72,
+  },
+  emptyStateIconTile: {
+    width: 76, height: 76, borderRadius: 20, marginBottom: 22,
+    backgroundColor: "rgba(255,61,20,0.10)", borderWidth: 1, borderColor: "rgba(255,61,20,0.22)",
+    alignItems: "center", justifyContent: "center",
+  },
+  emptyStateTitle: {
+    fontFamily: "Geist_700Bold", fontSize: 21, fontWeight: "700", color: "#FAF5EE",
+    letterSpacing: -0.2, textAlign: "center",
+  },
+  emptyStateSub: {
+    fontFamily: "Geist_400Regular", fontSize: 14.5, color: "#9C8E83",
+    lineHeight: 22, marginTop: 8, textAlign: "center", maxWidth: 380,
+  },
+  emptyStateCTA: {
+    flexDirection: "row", alignItems: "center", gap: 7,
+    height: 42, paddingHorizontal: 18, marginTop: 24,
+    borderRadius: 10, backgroundColor: "#FF3D14",
+  },
+  emptyStateCTAText: {
+    fontFamily: "Geist_700Bold", fontSize: 14.5, fontWeight: "700", color: "#fff",
+  },
+
+  // ── Driver selector modal ────────────────────────────────────────────────
+  driverSelectorBackdrop: {
+    flex: 1, backgroundColor: "rgba(10,8,6,0.72)", alignItems: "center",
+    justifyContent: "flex-start", paddingTop: 80, paddingHorizontal: 20,
+  },
+  driverSelectorPanel: {
+    width: "100%", maxWidth: 460, maxHeight: "80%",
+    backgroundColor: "#211C18", borderRadius: 16, overflow: "hidden",
+    borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    shadowColor: "#000", shadowOffset: { width: 0, height: 24 }, shadowOpacity: 0.5, shadowRadius: 48,
+    elevation: 20,
+  },
+  driverSelectorHeader: {
+    flexDirection: "row", alignItems: "center", gap: 12,
+    paddingHorizontal: 20, paddingTop: 18, paddingBottom: 16,
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.08)",
+  },
+  driverSelectorIconWrap: {
+    width: 36, height: 36, borderRadius: 10, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,61,20,0.14)", flexShrink: 0,
+  },
+  driverSelectorTitle: {
+    fontFamily: "Geist_700Bold", fontSize: 17, fontWeight: "700", color: "#FAF5EE", lineHeight: 18,
+  },
+  driverSelectorSub: {
+    fontFamily: "Geist_400Regular", fontSize: 12.5, color: "#9C8E83", marginTop: 3,
+  },
+  driverSelectorCloseBtn: {
+    width: 34, height: 34, borderRadius: 8, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(239,231,218,0.05)", borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+    flexShrink: 0,
+  },
+  driverSelectorList: {
+    flexGrow: 0,
+  },
+  driverSelectorRow: {
+    flexDirection: "row", alignItems: "center", gap: 12,
+    paddingHorizontal: 10, paddingVertical: 11, borderRadius: 11,
+    borderWidth: 1, borderColor: "transparent",
+  },
+  driverSelectorRowCurrent: {
+    backgroundColor: "rgba(255,61,20,0.10)", borderColor: "rgba(255,61,20,0.28)",
+  },
+  driverSelectorRowDisabled: {
     opacity: 0.5,
   },
-  orderCardTop: {
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    gap: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: "#dedede",
-  },
-  orderBadgesRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    marginBottom: 6,
-  },
-  orderTypeBadge: {
-    borderRadius: 999,
-    borderWidth: 1,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-  },
-  orderTypeBadgeTakeaway: {
-    borderColor: "#ffd6a3",
-    backgroundColor: "#fff5e8",
-  },
-  orderTypeBadgeText: {
-    fontSize: 12,
-    fontWeight: "700",
-  },
-  orderTypeBadgeTextTakeaway: {
-    color: "#c76b00",
-  },
-  orderHeaderRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 14,
-  },
-  deliveredBadge: {
-    backgroundColor: "#eaf8ef",
-    borderColor: "#bde7ca",
-    borderWidth: 1,
-    borderRadius: 8,
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-  },
-  deliveredBadgeText: {
-    color: "#1d7a43",
-    fontSize: 14,
-    fontWeight: "700",
-  },
-  departureBadge: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#d6d9dd",
-    backgroundColor: "#f4f5f7",
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-  },
-  departureBadgeLate: {
-    borderColor: "#f0c7c7",
-    backgroundColor: "#fff1f1",
-  },
-  departureBadgeText: {
-    color: "#4d5660",
-    fontSize: 14,
-    fontWeight: "700",
-    fontVariant: ["tabular-nums"],
-  },
-  departureBadgeTextLate: {
-    color: "#b3261e",
-  },
-  orderSmallText: {
-    fontSize: 14,
-    fontWeight: "500",
-    color: "#666666",
-  },
-  orderCustomerName: {
-    fontSize: 20,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
-  orderHeaderCustomerBlock: {
-    flexShrink: 1,
-    gap: 2,
-  },
-  orderCustomerPhone: {
-    fontSize: 14,
-    fontWeight: "600",
-    color: "#666666",
-  },
-  orderCustomerContactRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    flexWrap: "wrap",
-  },
-  orderWhatsAppButton: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    borderRadius: 999,
-    borderWidth: 1,
-    borderColor: "#bde7ca",
-    backgroundColor: "#eaf8ef",
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  orderWhatsAppButtonText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1d7a43",
-  },
-  dispatchDurationInfoContainer: {
-    borderRadius: 8,
-    flexDirection: 'column',
-    // borderWidth: 1,
-    // borderColor: "#e6ebf2",
-    // backgroundColor: "#f5f8fc",
-    // paddingHorizontal: 10,
-    // paddingVertical: 8,
-    gap: 0,
-  },
-  dispatchDurationInfoRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 3,
-    borderWidth: 1,
-    paddingVertical: 4,
-    paddingHorizontal: 8,
-    borderRadius: 8,
-    backgroundColor: "#f5f6f7",
-    borderColor: "#d6d9dd",
-  },
-  dispatchDurationInfoLabel: {
-    fontSize: 15,
-    color: "#5a6672",
-    fontWeight: '500'
-    // fontWeight: "600",
-  },
-  dispatchDurationInfoValue: {
-    fontSize: 15,
-    color: "#2d2d2d",
-    fontWeight: "700",
-  },
-  noteContainer: {
-    marginTop: 4,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#ffe0b2",
-    backgroundColor: "#fff4e6",
-  },
-  noteInner: {
-    height: 38,
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 10,
-    paddingHorizontal: 14,
-  },
-  noteText: {
-    fontSize: 15,
-    color: "#e67e22",
-    flexShrink: 1,
-  },
-  orderActionButton: {
-    height: 48,
-    borderRadius: 10,
-    backgroundColor: "#f0f0f0",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  showMoreSection: {
-    paddingVertical: 12,
-    paddingHorizontal: 16
-  },
-  showMoreSectionWithDivider: {
-    borderTopWidth: 1,
-    borderTopColor: "#dedede",
-  },
-  showMoreButton: {
-    paddingVertical: 12,
-    borderRadius: 10,
-    backgroundColor: "#f0f0f0",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  showMoreButtonText: {
-    fontSize: 17,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
-  orderFooterButtonsRow: {
-    flexDirection: "row",
-    gap: 8,
-  },
-  orderFooterButton: {
-    flex: 1,
-  },
-  orderActionButtonDisabled: {
-    opacity: 0.6,
-  },
-  orderActionButtonText: {
-    fontSize: 17,
-    fontWeight: "600",
-    color: "#2d2d2d",
-  },
-  orderItemsContainer: {
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    gap: 10,
-  },
-  orderItemBlock: {
-    width: "100%",
-  },
-  orderItemRow: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "#dedede",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: 12,
-  },
-  orderItemRowWithTasks: {
-    borderBottomLeftRadius: 12,
-    borderBottomRightRadius: 0,
-  },
-  orderItemContent: {
-    flex: 1,
-    flexDirection: 'row',
-    alignItems: 'center'
-  },
-  orderItemText: {
-    fontSize: 17,
-    fontWeight: "600",
-    lineHeight: 22,
-    color: "#2d2d2d",
-    flex: 1,
-  },
-  orderTaskRow: {
-    borderLeftWidth: 1,
-    borderRightWidth: 1,
-    borderBottomWidth: 1,
-    borderColor: "#dedede",
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    justifyContent: "center",
-  },
-  orderTaskRowStep: {
-    marginLeft: 16,
-  },
-  orderTaskRowModifier: {
-    marginLeft: 32,
-  },
-  orderTaskRowWithChildren: {
-    borderBottomLeftRadius: 12,
-    borderBottomRightRadius: 0,
-  },
-  orderTaskRowLast: {
-    borderBottomLeftRadius: 12,
-    borderBottomRightRadius: 12,
-  },
-  orderTaskRowText: {
-    fontSize: 17,
-    fontWeight: "600",
-    lineHeight: 22,
-    color: "#2d2d2d",
-    flex: 1,
-  },
-  orderTaskRowInner: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-  },
-  orderTaskCompletedBadge: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#bde7ca",
-    backgroundColor: "#eaf8ef",
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-  },
-  orderTaskCompletedBadgeText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1d7a43",
-  },
-  prizeBadge: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#b7d6fb",
-    backgroundColor: "#eaf3ff",
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-  },
-  prizeBadgeText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1e5da9",
-  },
-  rewardBadge: {
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#c8eed3",
-    backgroundColor: "#eefaf2",
-    paddingHorizontal: 6,
-    paddingVertical: 4,
-  },
-  rewardBadgeText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1d7a43",
-  },
-  orderItemStatus: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#B35A2A",
-  },
-  orderItemDeliveredStatus: {
-    color: "#2D7B44",
-  },
-  feedbackText: {
-    fontSize: 15,
-    fontWeight: "600",
-    color: "#666666",
-    paddingHorizontal: 4,
-  },
-  errorText: {
-    fontSize: 15,
-    fontWeight: "600",
-    color: "#b3261e",
-    paddingHorizontal: 4,
-  },
-  mapDrawerLayer: {
-    ...StyleSheet.absoluteFillObject,
-    zIndex: 40,
-    flexDirection: "row",
-    justifyContent: "flex-end",
-  },
-  mapDrawerBackdrop: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "#00000055",
-  },
-  mapDrawer: {
-    width: "100%",
-    height: "100%",
-    backgroundColor: "#ffffff",
-    borderLeftWidth: 0,
-    padding: 16,
-    gap: 12,
-  },
-  mapDrawerHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-  },
-  mapDrawerTitle: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#2d2d2d",
-  },
-  mapDrawerSubtitle: {
-    fontSize: 13,
-    color: "#666666",
-    marginTop: 2,
-  },
-  mapDrawerCloseButton: {
-    height: 32,
-    width: 32,
-    borderRadius: 8,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "#f0f0f0",
-  },
-  routeMapInteractive: {
-    flex: 2,
-    minWidth: 0,
-    minHeight: 420,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#dedede",
-    backgroundColor: "#f2f2f2",
-  },
-  routeMapFallbackCard: {
-    flex: 2,
-    minHeight: 420,
-  },
-  routeContentRow: {
-    flexDirection: "row",
-    alignItems: "stretch",
-    gap: 12,
-  },
-  routePointsPanel: {
-    width: 360,
-    maxHeight: 420,
-    borderWidth: 1,
-    borderColor: "#dedede",
-    borderRadius: 10,
-    backgroundColor: "#ffffff",
-    padding: 8,
-    gap: 8,
-  },
-  routePointsScroll: {
-    flex: 1,
-  },
-  mapFallbackCard: {
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#dedede",
-    backgroundColor: "#f7f7f7",
-    padding: 12,
-  },
-  mapFallbackText: {
-    fontSize: 13,
-    color: "#666666",
-    fontWeight: "600",
-  },
-  routePointsBlock: {
-    gap: 8,
-  },
-  routeLoadingText: {
-    fontSize: 12,
-    color: "#666666",
-    fontWeight: "600",
-    marginBottom: 2,
-  },
-  routePointRow: {
-    flexDirection: "row",
-    gap: 10,
-    alignItems: "flex-start",
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "#e3e3e3",
-    paddingVertical: 8,
-    paddingHorizontal: 10,
-  },
-  routePointIndex: {
-    width: 20,
-    height: 20,
-    borderRadius: 10,
-    backgroundColor: "#1685fa",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  routePointIndexText: {
-    fontSize: 11,
-    color: "#ffffff",
-    fontWeight: "700",
-  },
-  routePointTextBlock: {
-    flex: 1,
-    gap: 1,
-  },
-  routePointLabel: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#2d2d2d",
-  },
-  routePointAddress: {
-    fontSize: 12,
-    color: "#666666",
-  },
-  routePointMapsButton: {
-    minHeight: 30,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: "#b7d6fb",
-    backgroundColor: "#eaf3ff",
-    paddingHorizontal: 8,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 4,
-  },
-  routePointMapsButtonText: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#1e5da9",
-  },
-  dispatchDropCard: {
-    width: "100%",
-    height: 72,
-    borderRadius: 12,
-    borderWidth: 2,
-    borderStyle: "dashed",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  dispatchDropCardActive: {
-    borderColor: "#dedede",
-    backgroundColor: "#ffffff",
-    opacity: 1,
-  },
-  dispatchDropCardInactive: {
-    borderColor: "#dedede",
-    backgroundColor: "#ffffff",
-    opacity: 0.7,
+  driverSelectorAvatar: {
+    width: 42, height: 42, borderRadius: 21, alignItems: "center", justifyContent: "center",
+    flexShrink: 0,
+    backgroundColor: "#C72A0A",
+  },
+  driverSelectorAvatarDisabled: {
+    backgroundColor: "rgba(239,231,218,0.08)",
+  },
+  driverSelectorAvatarText: {
+    fontFamily: "Geist_700Bold", fontSize: 14, fontWeight: "700", color: "#fff",
+  },
+  driverSelectorName: {
+    fontFamily: "Geist_600SemiBold", fontSize: 14.5, fontWeight: "600", color: "#FAF5EE", flex: 1,
+  },
+  driverSelectorCurrentBadge: {
+    backgroundColor: "rgba(255,61,20,0.14)", borderRadius: 999, paddingHorizontal: 7, paddingVertical: 2, flexShrink: 0,
+  },
+  driverSelectorCurrentBadgeText: {
+    fontFamily: "Geist_700Bold", fontSize: 10.5, fontWeight: "700",
+    color: "#FF7A5C", textTransform: "uppercase", letterSpacing: 0.4,
+  },
+  driverSelectorPriority: {
+    fontFamily: "GeistMono_500Medium", fontSize: 11.5, color: "#9C8E83", marginTop: 2,
+  },
+  driverSelectorStatusBadge: {
+    flexDirection: "row", alignItems: "center", gap: 6,
+    borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4, flexShrink: 0,
+  },
+  driverSelectorStatusDot: {
+    width: 6, height: 6, borderRadius: 3,
+  },
+  driverSelectorStatusText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 12, fontWeight: "600",
+  },
+  driverSelectorRowIcon: {
+    width: 22, alignItems: "center", flexShrink: 0,
+  },
+
+  // ── Route modal ──────────────────────────────────────────────────────────
+  routeModal: {
+    flex: 1, backgroundColor: "#16120F", flexDirection: "column",
+  },
+  routeModalTopBar: {
+    flexDirection: "row", alignItems: "center", gap: 10,
+    paddingHorizontal: 16, paddingVertical: 14,
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.08)",
+  },
+  routeModalIconWrap: {
+    width: 38, height: 38, borderRadius: 10, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,61,20,0.12)", borderWidth: 1, borderColor: "rgba(255,61,20,0.22)",
+    flexShrink: 0,
+  },
+  routeModalTitle: {
+    fontFamily: "Geist_700Bold", fontSize: 16, fontWeight: "700", color: "#FAF5EE", letterSpacing: -0.2,
+  },
+  routeModalSub: {
+    fontFamily: "Geist_400Regular", fontSize: 12, color: "rgba(250,245,238,0.55)", marginTop: 2,
+  },
+  routeModalTimePill: {
+    flexDirection: "row", alignItems: "center", gap: 5,
+    borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5,
+    backgroundColor: "rgba(255,61,20,0.10)", borderWidth: 1, borderColor: "rgba(255,61,20,0.20)",
+    flexShrink: 0,
+  },
+  routeModalTimePillText: {
+    fontFamily: "GeistMono_700Bold", fontSize: 13, fontWeight: "700", color: "#FF3D14",
+  },
+  routeModalTimePillSub: {
+    fontFamily: "Geist_400Regular", fontSize: 11, color: "rgba(255,61,20,0.65)",
+  },
+  routeModalCloseBtn: {
+    width: 34, height: 34, borderRadius: 9, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(250,245,238,0.07)", borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+    flexShrink: 0,
+  },
+  routeModalBody: {
+    flex: 1, flexDirection: "row",
+  },
+  routeModalMapArea: {
+    flex: 1, backgroundColor: "#0e0b09",
+  },
+  routeModalMapFallback: {
+    flex: 1, alignItems: "center", justifyContent: "center", gap: 12,
+  },
+  routeModalMapFallbackText: {
+    fontFamily: "Geist_500Medium", fontSize: 13, fontWeight: "500", color: "rgba(250,245,238,0.4)",
+  },
+  routeModalPanel: {
+    width: 320, flexDirection: "column",
+    borderLeftWidth: 1, borderLeftColor: "rgba(250,245,238,0.08)",
+    backgroundColor: "#1A1410",
+  },
+  routeModalPanelHeader: {
+    paddingHorizontal: 14, paddingVertical: 12,
+    borderBottomWidth: 1, borderBottomColor: "rgba(250,245,238,0.08)",
+  },
+  routeModalFullRouteBtn: {
+    flexDirection: "row", alignItems: "center", justifyContent: "center", gap: 7,
+    height: 40, borderRadius: 10, backgroundColor: "#FF3D14",
+  },
+  routeModalFullRouteBtnText: {
+    fontFamily: "Geist_700Bold", fontSize: 13.5, fontWeight: "700", color: "#fff",
+  },
+  routeModalStopsList: {
+    paddingHorizontal: 14, paddingVertical: 12, gap: 0,
+  },
+
+  // ── Route stop rows ───────────────────────────────────────────────────────
+  routeStopRow: {
+    flexDirection: "row", alignItems: "flex-start", gap: 12,
+  },
+  routeStopOriginIcon: {
+    width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center",
+    backgroundColor: "#FF3D14", flexShrink: 0, marginTop: 2,
+  },
+  routeStopReturnIcon: {
+    backgroundColor: "rgba(250,245,238,0.07)", borderWidth: 1, borderColor: "rgba(250,245,238,0.15)",
+  },
+  routeStopNumBubble: {
+    width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(255,61,20,0.15)", borderWidth: 1.5, borderColor: "#FF3D14",
+    flexShrink: 0, marginTop: 2,
+  },
+  routeStopNumText: {
+    fontFamily: "GeistMono_700Bold", fontSize: 13, fontWeight: "700", color: "#FF3D14",
+  },
+  routeStopInfo: {
+    flex: 1, minWidth: 0, paddingBottom: 4,
+  },
+  routeStopEyebrow: {
+    fontFamily: "Geist_600SemiBold", fontSize: 10, fontWeight: "600",
+    letterSpacing: 0.9, color: "rgba(250,245,238,0.45)", marginBottom: 3,
+  },
+  routeStopTitleRow: {
+    flexDirection: "row", alignItems: "center", gap: 8,
+  },
+  routeStopTitle: {
+    fontFamily: "Geist_700Bold", fontSize: 14, fontWeight: "700", color: "#FAF5EE", letterSpacing: -0.1,
+  },
+  routeStopAddressRow: {
+    flexDirection: "row", alignItems: "flex-start", gap: 5, marginTop: 3,
+  },
+  routeStopAddress: {
+    fontFamily: "Geist_400Regular", fontSize: 12, color: "rgba(250,245,238,0.55)", lineHeight: 17, flex: 1,
+  },
+  routeStopComplRow: {
+    flexDirection: "row", alignItems: "flex-start", gap: 5, marginTop: 3,
+  },
+  routeStopComplLabel: {
+    fontFamily: "Geist_600SemiBold", fontSize: 11, fontWeight: "600", color: "#FF3D14", flexShrink: 0,
+  },
+  routeStopCompl: {
+    fontFamily: "Geist_400Regular", fontSize: 11, color: "rgba(250,245,238,0.65)", flex: 1, lineHeight: 16,
+  },
+  routeStopMapsBtn: {
+    flexDirection: "row", alignItems: "center", gap: 4, alignSelf: "flex-start",
+    marginTop: 8, paddingHorizontal: 8, paddingVertical: 5, borderRadius: 7,
+    backgroundColor: "rgba(250,245,238,0.05)", borderWidth: 1, borderColor: "rgba(250,245,238,0.12)",
+  },
+  routeStopMapsBtnText: {
+    fontFamily: "Geist_600SemiBold", fontSize: 11, fontWeight: "600", color: "rgba(250,245,238,0.6)",
+  },
+
+  // ── Route connectors ──────────────────────────────────────────────────────
+  routeConnector: {
+    flexDirection: "row", alignItems: "center", paddingLeft: 17, gap: 8, marginVertical: 6,
+  },
+  routeConnectorLine: {
+    width: 2, height: 28, backgroundColor: "rgba(250,245,238,0.15)", borderRadius: 1, flexShrink: 0,
+  },
+  routeConnectorLineDashed: {
+    backgroundColor: "transparent", borderWidth: 1, borderStyle: "dashed", borderColor: "rgba(250,245,238,0.12)", width: 0,
+  },
+  routeConnectorChip: {
+    width: 22, height: 22, borderRadius: 11, alignItems: "center", justifyContent: "center",
+    backgroundColor: "rgba(250,245,238,0.06)", borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+  },
+  routeConnectorTimePill: {
+    paddingHorizontal: 7, paddingVertical: 3, borderRadius: 999,
+    backgroundColor: "rgba(250,245,238,0.06)", borderWidth: 1, borderColor: "rgba(250,245,238,0.10)",
+  },
+  routeConnectorTimeText: {
+    fontFamily: "GeistMono_500Medium", fontSize: 11, color: "rgba(250,245,238,0.5)",
   },
 });

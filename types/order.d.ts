@@ -1,7 +1,7 @@
 import TAddress from "./address";
 import TCustomer from "./costumer";
 import TProduct from "./product";
-import { TPreparationStepCategory } from "./station";
+import { TPreparationTaskStation } from "./station";
 
 export type TPaymentMethod = "CARD" | "CASH" | "ZELLE";
 export type TOrderType = "DELIVERY" | "TAKEAWAY";
@@ -19,7 +19,7 @@ export type TOrder = {
   addressId?: string;
   address?: TAddress;
   orderProducts: TOrderProduct[];
-  preparationStepCategory: TPreparationStepCategory[];
+  preparationTaskStation: TPreparationTaskStation[];
 };
 
 export type TOrderProduct = {
